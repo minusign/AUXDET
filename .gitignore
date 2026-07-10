@@ -121,3 +121,46 @@ work_dirs/
 *.pth
 *.py~
 *.sh~
+
+# mypy
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+
+
+# Custom generated files
+*.pkl
+*.pkl.json
+*.log.json
+docs/modelzoo_statistics.md
+mmdet/.mim
+
+# Local datasets in project root
+/data/
+/data_root/
+/datasets/
+
+# Training outputs
+/work_dirs/
+/outputs/
+/runs/
+/logs/
+/checkpoints/
+
+# Model files
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.engine
+*.safetensors
+
+# Temporary files
+*.py~
+*.sh~
+
+your_path/

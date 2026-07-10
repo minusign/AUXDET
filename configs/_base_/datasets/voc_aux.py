@@ -1,6 +1,6 @@
 # dataset settings
 dataset_type = "VSBWILDVOCDetDataset"
-data_root = "/data/dataset/syt/data/VOCdevkit/"
+data_root = "/home/ices/cjh/AuxDet/data_root/"
 
 METAINFO = {
     "classes": ("Target",),
@@ -57,9 +57,9 @@ train_dataloader = dict(
             type=dataset_type,
             data_root=data_root,
             metainfo=METAINFO,
-            ann_file='VOC2007/ImageSets/Main0/train.txt',
+            ann_file='VOC2007/ImageSets/Main/train.txt',
             img_subdir="PNGImages",
-            ann_subdir="Annotations1",
+            ann_subdir="Annotations",
             data_prefix=dict(sub_data_root='VOC2007/'),
             filter_cfg=dict(filter_empty_gt=False, min_size=0, bbox_min_size=0),
             pipeline=train_pipeline,
@@ -77,9 +77,9 @@ val_dataloader = dict(
         type=dataset_type,
         data_root=data_root,
         metainfo=METAINFO,
-        ann_file='VOC2007/ImageSets/Main0/val.txt',
+        ann_file='VOC2007/ImageSets/Main/val.txt',
         img_subdir="PNGImages",
-        ann_subdir="Annotations1",
+        ann_subdir="Annotations",
         data_prefix=dict(sub_data_root='VOC2007/'),
         test_mode=True,
         pipeline=test_pipeline,
