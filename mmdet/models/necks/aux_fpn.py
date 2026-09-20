@@ -15,6 +15,39 @@ from mmdet.models.utils import DMLPAttention, FCResLayer
 from mmdet.structures import DetDataSample
 
 
+class RingLocalContrast(nn.Module):
+    """Parameter-free local contrast against a ring-shaped background."""
+
+    def __init__(self, outer_kernel: int = 7, inner_kernel: int = 3):
+        super().__init__()
+        if outer_kernel <= inner_kernel:
+            raise ValueError('outer_kernel must be larger than inner_kernel')
+        if outer_kernel % 2 == 0 or inner_kernel % 2 == 0:
+            raise ValueError('RingLocalContrast requires odd kernel sizes')
+        if inner_kernel <= 0:
+            raise ValueError('inner_kernel must be positive')
+
+        self.outer_kernel = outer_kernel
+        self.inner_kernel = inner_kernel
+        self.ring_area = outer_kernel**2 - inner_kernel**2
+
+    @staticmethod
+    def _avg_pool_same(x: Tensor, kernel_size: int) -> Tensor:
+        padding = kernel_size // 2
+        # Replication keeps constant feature maps constant at image boundaries.
+        x = F.pad(x, (padding, padding, padding, padding), mode='replicate')
+        return F.avg_pool2d(x, kernel_size=kernel_size, stride=1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        outer_avg = self._avg_pool_same(x, self.outer_kernel)
+        inner_avg = self._avg_pool_same(x, self.inner_kernel)
+        background = (
+            self.outer_kernel**2 * outer_avg
+            - self.inner_kernel**2 * inner_avg
+        ) / self.ring_area
+        return x - background
+
+
 @MODELS.register_module()
 class AuxFPN(BaseModule):
     r"""Feature Pyramid Network.
@@ -52,6 +85,12 @@ class AuxFPN(BaseModule):
             activation layer in ConvModule. Defaults to None.
         upsample_cfg (:obj:`ConfigDict` or dict, optional): Config dict
             for interpolate layer. Defaults to dict(mode='nearest').
+        vmcr_enabled (bool): Whether to enable the parameter-free ring local
+            contrast branch. Defaults to False.
+        vmcr_levels (tuple[int]): Lateral levels enhanced by VMCR.
+            Defaults to (0, 1).
+        vmcr_outer_kernel (int): Outer window size of the ring. Defaults to 7.
+        vmcr_inner_kernel (int): Inner window size of the ring. Defaults to 3.
         init_cfg (:obj:`ConfigDict` or dict or list[:obj:`ConfigDict` or \
             dict]): Initialization config dict.
 
@@ -85,6 +124,10 @@ class AuxFPN(BaseModule):
             norm_cfg: OptConfigType = None,
             act_cfg: OptConfigType = None,
             upsample_cfg: ConfigType = dict(mode='nearest'),
+            vmcr_enabled: bool = False,
+            vmcr_levels: Tuple[int, ...] = (0, 1),
+            vmcr_outer_kernel: int = 7,
+            vmcr_inner_kernel: int = 3,
             init_cfg: MultiConfig = dict(
                 type='Xavier', layer='Conv2d', distribution='uniform')
     ) -> None:
@@ -147,6 +190,27 @@ class AuxFPN(BaseModule):
             EdgeConvSep(out_channels, out_channels)
             for _ in range(2)
         ])
+
+        # B0 VMCR: parameter-free ring contrast with one zero-initialized,
+        # learnable residual scale per selected shallow level. Keeping
+        # edge_convs untouched preserves all existing checkpoint keys.
+        self.vmcr_enabled = vmcr_enabled
+        self.vmcr_levels = tuple(vmcr_levels)
+        if len(set(self.vmcr_levels)) != len(self.vmcr_levels):
+            raise ValueError('vmcr_levels must not contain duplicate levels')
+        if any(level < 0 or level >= len(self.edge_convs)
+               for level in self.vmcr_levels):
+            raise ValueError('vmcr_levels must only contain lateral levels 0 or 1')
+        if self.vmcr_enabled:
+            self.vmcr_contrast = RingLocalContrast(
+                outer_kernel=vmcr_outer_kernel,
+                inner_kernel=vmcr_inner_kernel)
+            self.vmcr_betas = nn.ParameterList([
+                nn.Parameter(torch.zeros(1)) for _ in self.vmcr_levels
+            ])
+            self._vmcr_level_to_beta = {
+                level: index for index, level in enumerate(self.vmcr_levels)
+            }
 
         # add extra conv layers (e.g., RetinaNet)
         extra_levels = num_outs - self.backbone_end_level + self.start_level
@@ -246,9 +310,18 @@ class AuxFPN(BaseModule):
             for i, edge_conv in enumerate(self.edge_convs)
         ]
 
-        # 边缘增强后 与原特征 融合
+        # 边缘增强后 与原特征 融合（保留原 AuxDet 路径）
         for i in range(len(edge_features)):  # 只遍历前两个
-            laterals[i] = laterals[i] + alphas[i] * edge_features[i]
+            contrast_input = laterals[i]
+            baseline_feature = (
+                contrast_input + alphas[i] * edge_features[i])
+            if self.vmcr_enabled and i in self._vmcr_level_to_beta:
+                beta_index = self._vmcr_level_to_beta[i]
+                contrast_residual = self.vmcr_contrast(contrast_input)
+                baseline_feature = (
+                    baseline_feature
+                    + self.vmcr_betas[beta_index] * contrast_residual)
+            laterals[i] = baseline_feature
 
         # build top-down path
         used_backbone_levels = len(laterals)
