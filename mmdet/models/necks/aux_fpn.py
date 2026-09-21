@@ -91,6 +91,12 @@ class AuxFPN(BaseModule):
             Defaults to (0, 1).
         vmcr_outer_kernel (int): Outer window size of the ring. Defaults to 7.
         vmcr_inner_kernel (int): Inner window size of the ring. Defaults to 3.
+        vmcr_visual_gate_enabled (bool): Whether to modulate each VMCR residual
+            with an independent per-level visual gate. Defaults to False.
+        vmcr_visual_gate_hidden_dim (int): Hidden dimension of each visual gate
+            MLP. Defaults to 32.
+        vmcr_visual_gate_range (float): Symmetric range around one for the
+            visual gate. Defaults to 0.5, giving a gate in (0.5, 1.5).
         init_cfg (:obj:`ConfigDict` or dict or list[:obj:`ConfigDict` or \
             dict]): Initialization config dict.
 
@@ -128,6 +134,9 @@ class AuxFPN(BaseModule):
             vmcr_levels: Tuple[int, ...] = (0, 1),
             vmcr_outer_kernel: int = 7,
             vmcr_inner_kernel: int = 3,
+            vmcr_visual_gate_enabled: bool = False,
+            vmcr_visual_gate_hidden_dim: int = 32,
+            vmcr_visual_gate_range: float = 0.5,
             init_cfg: MultiConfig = dict(
                 type='Xavier', layer='Conv2d', distribution='uniform')
     ) -> None:
@@ -211,6 +220,24 @@ class AuxFPN(BaseModule):
             self._vmcr_level_to_beta = {
                 level: index for index, level in enumerate(self.vmcr_levels)
             }
+        self.vmcr_visual_gate_enabled = (
+            self.vmcr_enabled and vmcr_visual_gate_enabled)
+        self.vmcr_visual_gate_range = vmcr_visual_gate_range
+        if vmcr_visual_gate_hidden_dim <= 0:
+            raise ValueError('vmcr_visual_gate_hidden_dim must be positive')
+        if vmcr_visual_gate_range < 0:
+            raise ValueError('vmcr_visual_gate_range must be non-negative')
+        if self.vmcr_visual_gate_enabled:
+            self.vmcr_visual_gap = nn.AdaptiveAvgPool2d(1)
+            self.vmcr_visual_gates = nn.ModuleList()
+            for _ in self.vmcr_levels:
+                gate = nn.Sequential(
+                    nn.Linear(out_channels, vmcr_visual_gate_hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(vmcr_visual_gate_hidden_dim, 1))
+                nn.init.zeros_(gate[-1].weight)
+                nn.init.zeros_(gate[-1].bias)
+                self.vmcr_visual_gates.append(gate)
 
         # add extra conv layers (e.g., RetinaNet)
         extra_levels = num_outs - self.backbone_end_level + self.start_level
@@ -318,6 +345,16 @@ class AuxFPN(BaseModule):
             if self.vmcr_enabled and i in self._vmcr_level_to_beta:
                 beta_index = self._vmcr_level_to_beta[i]
                 contrast_residual = self.vmcr_contrast(contrast_input)
+                if self.vmcr_visual_gate_enabled:
+                    visual_feature = self.vmcr_visual_gap(
+                        contrast_input).flatten(1)
+                    gate_logit = self.vmcr_visual_gates[beta_index](
+                        visual_feature)
+                    visual_gate = (
+                        1 + self.vmcr_visual_gate_range
+                        * torch.tanh(gate_logit)
+                    ).view(-1, 1, 1, 1)
+                    contrast_residual = visual_gate * contrast_residual
                 baseline_feature = (
                     baseline_feature
                     + self.vmcr_betas[beta_index] * contrast_residual)
