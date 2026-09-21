@@ -97,6 +97,12 @@ class AuxFPN(BaseModule):
             MLP. Defaults to 32.
         vmcr_visual_gate_range (float): Symmetric range around one for the
             visual gate. Defaults to 0.5, giving a gate in (0.5, 1.5).
+        vmcr_metadata_gate_enabled (bool): Whether to additionally modulate the
+            VMCR residual with platform and band features. Defaults to False.
+        vmcr_metadata_gate_hidden_dim (int): Hidden dimension of the metadata
+            gate MLP. Defaults to 32.
+        vmcr_metadata_gate_range (float): Symmetric range around one for the
+            metadata gate. Defaults to 0.5.
         init_cfg (:obj:`ConfigDict` or dict or list[:obj:`ConfigDict` or \
             dict]): Initialization config dict.
 
@@ -137,6 +143,9 @@ class AuxFPN(BaseModule):
             vmcr_visual_gate_enabled: bool = False,
             vmcr_visual_gate_hidden_dim: int = 32,
             vmcr_visual_gate_range: float = 0.5,
+            vmcr_metadata_gate_enabled: bool = False,
+            vmcr_metadata_gate_hidden_dim: int = 32,
+            vmcr_metadata_gate_range: float = 0.5,
             init_cfg: MultiConfig = dict(
                 type='Xavier', layer='Conv2d', distribution='uniform')
     ) -> None:
@@ -238,6 +247,17 @@ class AuxFPN(BaseModule):
                 nn.init.zeros_(gate[-1].weight)
                 nn.init.zeros_(gate[-1].bias)
                 self.vmcr_visual_gates.append(gate)
+        if vmcr_metadata_gate_enabled and not (
+                vmcr_enabled and vmcr_visual_gate_enabled):
+            raise ValueError(
+                'vmcr_metadata_gate_enabled requires both vmcr_enabled and '
+                'vmcr_visual_gate_enabled')
+        self.vmcr_metadata_gate_enabled = vmcr_metadata_gate_enabled
+        self.vmcr_metadata_gate_range = vmcr_metadata_gate_range
+        if vmcr_metadata_gate_hidden_dim <= 0:
+            raise ValueError('vmcr_metadata_gate_hidden_dim must be positive')
+        if vmcr_metadata_gate_range < 0:
+            raise ValueError('vmcr_metadata_gate_range must be non-negative')
 
         # add extra conv layers (e.g., RetinaNet)
         extra_levels = num_outs - self.backbone_end_level + self.start_level
@@ -276,6 +296,17 @@ class AuxFPN(BaseModule):
 
         # 高层语义补偿后的辅助特征处理
         self.meta_process_with_sem = MetaFeatureProcessorWithSem(channel_outs=out_channels // 2)
+        if self.vmcr_metadata_gate_enabled:
+            metadata_gate_input_dim = (
+                self.meta_process_with_sem.metadata_feature_dim * 2)
+            self.vmcr_metadata_gate = nn.Sequential(
+                nn.Linear(metadata_gate_input_dim,
+                          vmcr_metadata_gate_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(vmcr_metadata_gate_hidden_dim,
+                          len(self.vmcr_levels)))
+            nn.init.zeros_(self.vmcr_metadata_gate[-1].weight)
+            nn.init.zeros_(self.vmcr_metadata_gate[-1].bias)
 
         self.mlp = nn.Sequential(
             nn.Linear(out_channels//2, out_channels//4),
@@ -305,13 +336,27 @@ class AuxFPN(BaseModule):
         ]
 
         alphas = []
+        metadata_gates = None
         for idx in range(2):
             # step 1. 获取补偿特征并降维
             sem_comp_fea = self.downsamples[idx](laterals[idx]) - laterals[-1]
             sem_inf = self.sem_gap(sem_comp_fea).flatten(1)
             # step 2. 融合 元数据特征及补偿特征，得到最终辅助特征
-            all_aux_fea = self.meta_process_with_sem(
-                meta_inf, inputs[0].dtype, inputs[0].device, sem_inf)
+            metadata_output = self.meta_process_with_sem(
+                meta_inf, inputs[0].dtype, inputs[0].device, sem_inf,
+                return_metadata_features=(
+                    self.vmcr_metadata_gate_enabled and idx == 0))
+            if self.vmcr_metadata_gate_enabled and idx == 0:
+                all_aux_fea, view_feat, band_feat = metadata_output
+                metadata_gate_input = torch.cat(
+                    [view_feat, band_feat], dim=-1)
+                metadata_gate_logits = self.vmcr_metadata_gate(
+                    metadata_gate_input)
+                metadata_gates = (
+                    1 + self.vmcr_metadata_gate_range
+                    * torch.tanh(metadata_gate_logits))
+            else:
+                all_aux_fea = metadata_output
 
             # 为当前层计算 ALPHA 并保存，用于自适应调整后续边缘特征增强
             current_alpha = self.mlp(all_aux_fea).view(-1, 1, 1, 1)
@@ -355,6 +400,10 @@ class AuxFPN(BaseModule):
                         * torch.tanh(gate_logit)
                     ).view(-1, 1, 1, 1)
                     contrast_residual = visual_gate * contrast_residual
+                if self.vmcr_metadata_gate_enabled:
+                    metadata_gate = metadata_gates[:, beta_index].view(
+                        -1, 1, 1, 1)
+                    contrast_residual = metadata_gate * contrast_residual
                 baseline_feature = (
                     baseline_feature
                     + self.vmcr_betas[beta_index] * contrast_residual)
@@ -410,6 +459,7 @@ class AuxFPN(BaseModule):
 class MetaFeatureProcessorWithSem(nn.Module):
     def __init__(self, channel_outs=256):
         super().__init__()
+        self.metadata_feature_dim = channel_outs // 4
         # 视角编码 MLP：3 (one-hot) -> 64
         self.view_mlp = nn.Sequential(
             nn.Linear(3, channel_outs // 4),
@@ -446,7 +496,9 @@ class MetaFeatureProcessorWithSem(nn.Module):
             FCResLayer(channel_outs),
         )
 
-    def forward(self, meta_inf: list, x_dtype: torch.dtype, device: torch.device, sem_inf: torch.Tensor) -> torch.Tensor:
+    def forward(self, meta_inf: list, x_dtype: torch.dtype,
+                device: torch.device, sem_inf: torch.Tensor,
+                return_metadata_features: bool = False):
         """处理元数据并融合补偿特征，生成最终辅助特征
 
         Args:
@@ -454,6 +506,7 @@ class MetaFeatureProcessorWithSem(nn.Module):
             x_dtype (torch.dtype): 目标数据类型
             device (torch.device): 目标设备
             sem_inf (torch.Tensor): 语义补偿特征
+            return_metadata_features (bool): 是否同时返回平台与波段编码特征
 
         Returns:
             torch.Tensor: 维度为 [batch_size, channel_outs] 的融合特征
@@ -504,6 +557,8 @@ class MetaFeatureProcessorWithSem(nn.Module):
         # 元数据特征-补偿特征融合 [B, channel_outs]
         all_aux_inf = self.fusion_mlp(torch.cat([vsb_features, sem_feat], dim=-1))
 
+        if return_metadata_features:
+            return all_aux_inf, view_feat, band_feat
         return all_aux_inf
 
 
