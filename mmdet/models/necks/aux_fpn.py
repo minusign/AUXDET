@@ -91,6 +91,12 @@ class AuxFPN(BaseModule):
             Defaults to (0, 1).
         vmcr_outer_kernel (int): Outer window size of the ring. Defaults to 7.
         vmcr_inner_kernel (int): Inner window size of the ring. Defaults to 3.
+        vmcr_multiscale_enabled (bool): Whether to add a second parameter-free
+            ring contrast branch. Defaults to False.
+        vmcr_multiscale_outer_kernel (int): Outer window size of the second
+            ring. Defaults to 11.
+        vmcr_multiscale_inner_kernel (int): Inner window size of the second
+            ring. Defaults to 5.
         init_cfg (:obj:`ConfigDict` or dict or list[:obj:`ConfigDict` or \
             dict]): Initialization config dict.
 
@@ -128,6 +134,9 @@ class AuxFPN(BaseModule):
             vmcr_levels: Tuple[int, ...] = (0, 1),
             vmcr_outer_kernel: int = 7,
             vmcr_inner_kernel: int = 3,
+            vmcr_multiscale_enabled: bool = False,
+            vmcr_multiscale_outer_kernel: int = 11,
+            vmcr_multiscale_inner_kernel: int = 5,
             init_cfg: MultiConfig = dict(
                 type='Xavier', layer='Conv2d', distribution='uniform')
     ) -> None:
@@ -211,6 +220,15 @@ class AuxFPN(BaseModule):
             self._vmcr_level_to_beta = {
                 level: index for index, level in enumerate(self.vmcr_levels)
             }
+        self.vmcr_multiscale_enabled = (
+            self.vmcr_enabled and vmcr_multiscale_enabled)
+        if self.vmcr_multiscale_enabled:
+            self.vmcr_multiscale_contrast = RingLocalContrast(
+                outer_kernel=vmcr_multiscale_outer_kernel,
+                inner_kernel=vmcr_multiscale_inner_kernel)
+            self.vmcr_gammas = nn.ParameterList([
+                nn.Parameter(torch.zeros(1)) for _ in self.vmcr_levels
+            ])
 
         # add extra conv layers (e.g., RetinaNet)
         extra_levels = num_outs - self.backbone_end_level + self.start_level
@@ -321,6 +339,12 @@ class AuxFPN(BaseModule):
                 baseline_feature = (
                     baseline_feature
                     + self.vmcr_betas[beta_index] * contrast_residual)
+                if self.vmcr_multiscale_enabled:
+                    multiscale_residual = self.vmcr_multiscale_contrast(
+                        contrast_input)
+                    baseline_feature = (
+                        baseline_feature
+                        + self.vmcr_gammas[beta_index] * multiscale_residual)
             laterals[i] = baseline_feature
 
         # build top-down path
