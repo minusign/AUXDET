@@ -124,7 +124,10 @@ class TwoStageDetector(BaseDetector):
         """
         x = self.backbone(batch_inputs)
         if self.with_neck:
-            x = self.neck(x, batch_data_samples)
+            if getattr(self.neck, 'ldb_enabled', False):
+                x = self.neck(x, batch_data_samples, batch_inputs=batch_inputs)
+            else:
+                x = self.neck(x, batch_data_samples)
         return x
 
     def _forward(self, batch_inputs: Tensor,

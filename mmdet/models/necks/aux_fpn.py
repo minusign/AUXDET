@@ -91,6 +91,10 @@ class AuxFPN(BaseModule):
             Defaults to (0, 1).
         vmcr_outer_kernel (int): Outer window size of the ring. Defaults to 7.
         vmcr_inner_kernel (int): Inner window size of the ring. Defaults to 3.
+        ldb_enabled (bool): Whether to inject preprocessed pixel detail into
+            the P2 lateral before M2DM. Defaults to False.
+        ldb_mode (str): 'pixel' or the block-mean ablation. Defaults to
+            'pixel'.
         init_cfg (:obj:`ConfigDict` or dict or list[:obj:`ConfigDict` or \
             dict]): Initialization config dict.
 
@@ -129,7 +133,9 @@ class AuxFPN(BaseModule):
             vmcr_outer_kernel: int = 7,
             vmcr_inner_kernel: int = 3,
             init_cfg: MultiConfig = dict(
-                type='Xavier', layer='Conv2d', distribution='uniform')
+                type='Xavier', layer='Conv2d', distribution='uniform'),
+            ldb_enabled: bool = False,
+            ldb_mode: str = 'pixel'
     ) -> None:
         super().__init__(init_cfg=init_cfg)
         assert isinstance(in_channels, list)
@@ -212,6 +218,20 @@ class AuxFPN(BaseModule):
                 level: index for index, level in enumerate(self.vmcr_levels)
             }
 
+        self.ldb_enabled = ldb_enabled
+        self.ldb_mode = ldb_mode
+        if ldb_mode not in ('pixel', 'block_mean'):
+            raise ValueError("ldb_mode must be 'pixel' or 'block_mean'")
+        if self.ldb_enabled:
+            if start_level != 0 or out_channels != 256:
+                raise ValueError('LDB requires start_level=0 and out_channels=256')
+            self.ldb_encoder = nn.Sequential(
+                nn.Conv2d(48, 32, kernel_size=3, padding=1, bias=False),
+                nn.GroupNorm(8, 32),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(32, 256, kernel_size=1, bias=False))
+            self.ldb_gamma = nn.Parameter(torch.zeros(1))
+
         # add extra conv layers (e.g., RetinaNet)
         extra_levels = num_outs - self.backbone_end_level + self.start_level
         if self.add_extra_convs and extra_levels >= 1:
@@ -257,13 +277,16 @@ class AuxFPN(BaseModule):
             nn.Sigmoid()  # 限制权重范围在 (0,1)
         )
 
-    def forward(self, inputs: Tuple[Tensor], meta_inf: List[DetDataSample]) -> Tuple[Tensor]:
+    def forward(self, inputs: Tuple[Tensor], meta_inf: List[DetDataSample],
+                batch_inputs: Tensor = None) -> Tuple[Tensor]:
         """Forward function.
 
         Args:
             inputs (tuple[Tensor]): Features from the upstream network, each is a 4D-tensor.
                 Shape: (Batch_size, Channels, H, W).
             meta_inf (List[DataSample]): Batch data samples containing meta information of images.
+            batch_inputs (Tensor, optional): The same preprocessed images sent
+                to the backbone. Required only when LDB is enabled.
 
         Returns:
             tuple[Tensor]: Output feature maps, each is a 4D-tensor.
@@ -276,6 +299,27 @@ class AuxFPN(BaseModule):
             lateral_conv(inputs[i + self.start_level])
             for i, lateral_conv in enumerate(self.lateral_convs)
         ]
+
+        # Inject pixel detail into the P2 lateral before the original M2DM
+        # loop, so M2DM and the subsequent edge/FPN paths see the same update.
+        if self.ldb_enabled:
+            if batch_inputs is None:
+                raise ValueError('LDB requires preprocessed batch_inputs')
+            if batch_inputs.ndim != 4 or batch_inputs.shape[1] != 3:
+                raise ValueError('LDB requires batch_inputs shaped [B, 3, H, W]')
+            height, width = batch_inputs.shape[-2:]
+            if height % 4 or width % 4:
+                raise ValueError('LDB input height and width must be divisible by 4')
+            if (batch_inputs.shape[0] != laterals[0].shape[0]
+                    or (height // 4, width // 4) != laterals[0].shape[-2:]):
+                raise ValueError('LDB pixel-unshuffle shape must match P2 lateral')
+            detail = F.pixel_unshuffle(batch_inputs, downscale_factor=4)
+            if self.ldb_mode == 'block_mean':
+                batch_size, _, detail_h, detail_w = detail.shape
+                blocks = detail.reshape(batch_size, 3, 16, detail_h, detail_w)
+                detail = blocks.mean(dim=2, keepdim=True).expand_as(blocks)
+                detail = detail.reshape(batch_size, 48, detail_h, detail_w)
+            laterals[0] = laterals[0] + self.ldb_gamma * self.ldb_encoder(detail)
 
         alphas = []
         for idx in range(2):
