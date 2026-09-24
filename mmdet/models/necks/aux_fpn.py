@@ -48,6 +48,35 @@ class RingLocalContrast(nn.Module):
         return x - background
 
 
+class TargetnessSupervisionModule(nn.Module):
+    """Lightweight P2 targetness prediction and residual refinement."""
+
+    def __init__(self, channels: int = 256, hidden_channels: int = 32):
+        super().__init__()
+        if channels != 256 or hidden_channels != 32:
+            raise ValueError(
+                'TSEM currently requires channels=256 and hidden_channels=32')
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(channels, hidden_channels, kernel_size=1),
+            nn.GroupNorm(8, hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                hidden_channels,
+                hidden_channels,
+                kernel_size=3,
+                padding=1,
+                groups=hidden_channels))
+        self.targetness_head = nn.Conv2d(
+            hidden_channels, 1, kernel_size=1)
+        self.residual_head = nn.Conv2d(
+            hidden_channels, channels, kernel_size=1)
+
+    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
+        hidden = self.stem(x)
+        return self.targetness_head(hidden), self.residual_head(hidden)
+
+
 @MODELS.register_module()
 class AuxFPN(BaseModule):
     r"""Feature Pyramid Network.
@@ -91,6 +120,10 @@ class AuxFPN(BaseModule):
             Defaults to (0, 1).
         vmcr_outer_kernel (int): Outer window size of the ring. Defaults to 7.
         vmcr_inner_kernel (int): Inner window size of the ring. Defaults to 3.
+        tsem_enabled (bool): Whether to enable P2 targetness supervision and
+            residual refinement. Defaults to False.
+        tsem_loss_weight (float): Weight of the targetness auxiliary loss.
+            Defaults to 0.1.
         init_cfg (:obj:`ConfigDict` or dict or list[:obj:`ConfigDict` or \
             dict]): Initialization config dict.
 
@@ -128,6 +161,8 @@ class AuxFPN(BaseModule):
             vmcr_levels: Tuple[int, ...] = (0, 1),
             vmcr_outer_kernel: int = 7,
             vmcr_inner_kernel: int = 3,
+            tsem_enabled: bool = False,
+            tsem_loss_weight: float = 0.1,
             init_cfg: MultiConfig = dict(
                 type='Xavier', layer='Conv2d', distribution='uniform')
     ) -> None:
@@ -211,6 +246,20 @@ class AuxFPN(BaseModule):
             self._vmcr_level_to_beta = {
                 level: index for index, level in enumerate(self.vmcr_levels)
             }
+
+        # TSEM is applied only to the completed P2 output. The zero-initialized
+        # scalar keeps the detection feature numerically identical to B0 at
+        # initialization while the targetness head receives direct supervision.
+        self.tsem_enabled = tsem_enabled
+        self.tsem_loss_weight = tsem_loss_weight
+        self._tsem_targetness_logits = None
+        if self.tsem_enabled:
+            if out_channels != 256:
+                raise ValueError('TSEM requires AuxFPN out_channels=256')
+            if self.tsem_loss_weight < 0:
+                raise ValueError('tsem_loss_weight must be non-negative')
+            self.tsem = TargetnessSupervisionModule(channels=out_channels)
+            self.tsem_gamma = nn.Parameter(torch.zeros(1))
 
         # add extra conv layers (e.g., RetinaNet)
         extra_levels = num_outs - self.backbone_end_level + self.start_level
@@ -366,8 +415,81 @@ class AuxFPN(BaseModule):
                     else:
                         outs.append(self.fpn_convs[i](outs[-1]))
 
+        if self.tsem_enabled:
+            targetness_logits, tsem_residual = self.tsem(outs[0])
+            outs[0] = (
+                outs[0]
+                + self.tsem_gamma
+                * targetness_logits.sigmoid()
+                * tsem_residual)
+            self._tsem_targetness_logits = (
+                targetness_logits if self.training else None)
+        else:
+            self._tsem_targetness_logits = None
+
         # return tuple(outs)
         return tuple(outs[:2])
+
+    @staticmethod
+    def _build_tsem_heatmap(
+            batch_data_samples: List[DetDataSample],
+            logits: Tensor) -> Tensor:
+        """Build P2 Gaussian heatmaps from GT box centers."""
+        batch_size, _, feat_h, feat_w = logits.shape
+        heatmaps = logits.new_zeros((batch_size, 1, feat_h, feat_w))
+        grid_y = torch.arange(
+            feat_h, device=logits.device, dtype=logits.dtype).view(feat_h, 1)
+        grid_x = torch.arange(
+            feat_w, device=logits.device, dtype=logits.dtype).view(1, feat_w)
+
+        for batch_index, data_sample in enumerate(batch_data_samples):
+            gt_bboxes = data_sample.gt_instances.bboxes
+            if hasattr(gt_bboxes, 'tensor'):
+                gt_bboxes = gt_bboxes.tensor
+            if gt_bboxes.numel() == 0:
+                continue
+            gt_bboxes = gt_bboxes.to(device=logits.device, dtype=logits.dtype)
+
+            image_shape = data_sample.metainfo.get(
+                'batch_input_shape',
+                data_sample.metainfo.get(
+                    'pad_shape', data_sample.metainfo['img_shape']))
+            image_h, image_w = image_shape[:2]
+            scale_x = feat_w / float(image_w)
+            scale_y = feat_h / float(image_h)
+
+            centers_x = (gt_bboxes[:, 0] + gt_bboxes[:, 2]) * 0.5 * scale_x
+            centers_y = (gt_bboxes[:, 1] + gt_bboxes[:, 3]) * 0.5 * scale_y
+            widths = (gt_bboxes[:, 2] - gt_bboxes[:, 0]).clamp_min(0) * scale_x
+            heights = (gt_bboxes[:, 3] - gt_bboxes[:, 1]).clamp_min(0) * scale_y
+            sigmas = (torch.minimum(widths, heights) / 6.0).clamp_min(1.0)
+
+            sample_heatmap = heatmaps[batch_index, 0]
+            for center_x, center_y, sigma in zip(
+                    centers_x, centers_y, sigmas):
+                gaussian = torch.exp(
+                    -((grid_x - center_x).square()
+                      + (grid_y - center_y).square())
+                    / (2.0 * sigma.square()))
+                sample_heatmap = torch.maximum(sample_heatmap, gaussian)
+            heatmaps[batch_index, 0] = sample_heatmap
+
+        return heatmaps
+
+    def loss_tsem(
+            self, batch_data_samples: List[DetDataSample]) -> dict:
+        """Calculate and consume the cached TSEM auxiliary loss."""
+        if not self.tsem_enabled:
+            return {}
+        if self._tsem_targetness_logits is None:
+            raise RuntimeError(
+                'TSEM loss requested without training targetness logits')
+
+        logits = self._tsem_targetness_logits
+        self._tsem_targetness_logits = None
+        target = self._build_tsem_heatmap(batch_data_samples, logits)
+        loss = F.binary_cross_entropy_with_logits(logits, target)
+        return {'loss_tsem': loss * self.tsem_loss_weight}
 
 
 class MetaFeatureProcessorWithSem(nn.Module):

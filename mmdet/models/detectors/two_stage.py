@@ -175,6 +175,8 @@ class TwoStageDetector(BaseDetector):
         x = self.extract_feat(batch_inputs, batch_data_samples)
 
         losses = dict()
+        if self.with_neck and hasattr(self.neck, 'loss_tsem'):
+            losses.update(self.neck.loss_tsem(batch_data_samples))
 
         # RPN forward and loss
         if self.with_rpn:

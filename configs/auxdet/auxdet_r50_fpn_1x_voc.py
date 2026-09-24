@@ -28,6 +28,8 @@ model = dict(
         vmcr_levels=(0, 1),
         vmcr_outer_kernel=7,
         vmcr_inner_kernel=3,
+        tsem_enabled=True,
+        tsem_loss_weight=0.1,
         ),
     rpn_head=dict(
         _delete_=True,
@@ -125,6 +127,5 @@ train_dataloader = dict(
     batch_size=4,
     num_workers=4,
 )
-
 
 
