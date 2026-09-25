@@ -1,6 +1,6 @@
 _base_ = ['./auxdet_r50_fpn_1x_voc.py']
 
-# B1: AuxDet + LFP on the P2/C2 lateral only.
+# B2: AuxDet + LFP on P2 after metadata modulation and EdgeConvSep fusion.
 model = dict(
     neck=dict(
         lfp_cfg=dict(
@@ -10,6 +10,6 @@ model = dict(
             gauss_gate=0.5,
         ),
         lfp_levels=(0,),
-        lfp_position='before_modulation',
+        lfp_position='after_edge',
     )
 )

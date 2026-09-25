@@ -34,9 +34,11 @@ class _WaveletTransform(nn.Module):
         with torch.cuda.amp.autocast(enabled=False):
             x_fp32 = x.float() if x.dtype != torch.float32 else x
             low, highs = self.dwt(x_fp32)
+        # pytorch_wavelets returns [B, C, 3, H, W]. Move the
+        # orientation axis before flattening so the inverse can restore it.
         high = highs[0].transpose(1, 2).reshape(
             highs[0].shape[0],
-            -1,
+            3 * highs[0].shape[1],
             highs[0].shape[3],
             highs[0].shape[4],
         )
@@ -44,7 +46,8 @@ class _WaveletTransform(nn.Module):
 
     def forward_idwt(self, low: Tensor, high: Tensor) -> Tensor:
         b, c, h, w = low.shape
-        high = high.reshape(b, c, 3, h, w)
+        # Inverse of [B,C,3,H,W] -> [B,3C,H,W].
+        high = high.reshape(b, 3, c, h, w).transpose(1, 2).contiguous()
         with torch.cuda.amp.autocast(enabled=False):
             rec = self.idwt((low, [high.float()]))
         return rec
@@ -153,11 +156,41 @@ class LFP(nn.Module):
             high = high * (1 - mask) + blurred * mask
 
         output = self._wavelet.forward_idwt(low, high)
-        if output.shape[-2:] != input_size:
-            output = F.interpolate(
-                output,
-                size=input_size,
-                mode='bilinear',
-                align_corners=False,
-            )
+        if output.shape[-2] < input_size[0] or output.shape[-1] < input_size[1]:
+            raise RuntimeError(
+                f'IDWT output {tuple(output.shape[-2:])} is smaller than '
+                f'input {tuple(input_size)}')
+        # DWT zero padding can make odd-size reconstruction one pixel larger.
+        # Crop the inverse transform back to the original spatial size.
+        output = output[..., :input_size[0], :input_size[1]]
         return output.to(dtype=x.dtype)
+
+
+@torch.no_grad()
+def check_dwt_idwt_reconstruction(
+    wave: str = 'haar',
+    mode: str = 'zero',
+    shape: Tuple[int, int, int, int] = (2, 5, 31, 29),
+    tolerance: float = 1e-5,
+) -> float:
+    """Check pure multi-channel DWT to IDWT reconstruction.
+
+    This deliberately bypasses attention and Gaussian filtering. The returned
+    value is the maximum absolute reconstruction error after cropping any
+    padding introduced for odd spatial dimensions.
+    """
+    transform = _WaveletTransform(wave=wave, mode=mode)
+    x = torch.randn(shape, dtype=torch.float32)
+    low, high = transform.forward_dwt(x)
+    reconstruction = transform.forward_idwt(low, high)
+    if reconstruction.shape[-2] < shape[-2] or reconstruction.shape[-1] < shape[-1]:
+        raise AssertionError(
+            f'IDWT output {tuple(reconstruction.shape[-2:])} is smaller than '
+            f'input {shape[-2:]}')
+    reconstruction = reconstruction[..., :shape[-2], :shape[-1]]
+    error = (reconstruction - x).abs().max().item()
+    if error > tolerance:
+        raise AssertionError(
+            f'DWT→IDWT reconstruction error {error:.6g} exceeds '
+            f'tolerance {tolerance:.6g}')
+    return error

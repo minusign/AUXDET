@@ -90,6 +90,7 @@ class AuxFPN(BaseModule):
                 type='Xavier', layer='Conv2d', distribution='uniform'),
             lfp_cfg: OptConfigType = None,
             lfp_levels: Tuple[int, ...] = (),
+            lfp_position: str = 'before_modulation',
     ) -> None:
         super().__init__(init_cfg=init_cfg)
         assert isinstance(in_channels, list)
@@ -102,6 +103,11 @@ class AuxFPN(BaseModule):
         self.fp16_enabled = False
         self.upsample_cfg = upsample_cfg.copy()
         self.lfp_levels = tuple(lfp_levels)
+        if lfp_position not in ('before_modulation', 'after_edge'):
+            raise ValueError(
+                "lfp_position must be 'before_modulation' or 'after_edge', "
+                f'got {lfp_position}')
+        self.lfp_position = lfp_position
         if any(level < 0 or level >= self.num_ins for level in self.lfp_levels):
             raise ValueError(
                 f'lfp_levels must be within [0, {self.num_ins}), '
@@ -228,10 +234,11 @@ class AuxFPN(BaseModule):
             for i, lateral_conv in enumerate(self.lateral_convs)
         ]
 
-        for level in self.lfp_levels:
-            level_key = str(level)
-            if level_key in self.lfp_modules:
-                laterals[level] = self.lfp_modules[level_key](laterals[level])
+        if self.lfp_position == 'before_modulation':
+            for level in self.lfp_levels:
+                level_key = str(level)
+                if level_key in self.lfp_modules:
+                    laterals[level] = self.lfp_modules[level_key](laterals[level])
 
         alphas = []
         for idx in range(2):
@@ -269,6 +276,12 @@ class AuxFPN(BaseModule):
         # 边缘增强后 与原特征 融合
         for i in range(len(edge_features)):  # 只遍历前两个
             laterals[i] = laterals[i] + alphas[i] * edge_features[i]
+
+        if self.lfp_position == 'after_edge':
+            for level in self.lfp_levels:
+                level_key = str(level)
+                if level_key in self.lfp_modules:
+                    laterals[level] = self.lfp_modules[level_key](laterals[level])
 
         # build top-down path
         used_backbone_levels = len(laterals)
