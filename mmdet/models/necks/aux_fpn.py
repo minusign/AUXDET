@@ -13,6 +13,7 @@ from einops import rearrange
 
 from mmdet.models.utils import DMLPAttention, FCResLayer
 from mmdet.structures import DetDataSample
+from .lfp import LFP
 
 
 @MODELS.register_module()
@@ -86,7 +87,9 @@ class AuxFPN(BaseModule):
             act_cfg: OptConfigType = None,
             upsample_cfg: ConfigType = dict(mode='nearest'),
             init_cfg: MultiConfig = dict(
-                type='Xavier', layer='Conv2d', distribution='uniform')
+                type='Xavier', layer='Conv2d', distribution='uniform'),
+            lfp_cfg: OptConfigType = None,
+            lfp_levels: Tuple[int, ...] = (),
     ) -> None:
         super().__init__(init_cfg=init_cfg)
         assert isinstance(in_channels, list)
@@ -98,6 +101,12 @@ class AuxFPN(BaseModule):
         self.no_norm_on_lateral = no_norm_on_lateral
         self.fp16_enabled = False
         self.upsample_cfg = upsample_cfg.copy()
+        self.lfp_levels = tuple(lfp_levels)
+        if any(level < 0 or level >= self.num_ins for level in self.lfp_levels):
+            raise ValueError(
+                f'lfp_levels must be within [0, {self.num_ins}), '
+                f'got {self.lfp_levels}')
+        self.lfp_modules = nn.ModuleDict()
 
         if end_level == -1 or end_level == self.num_ins - 1:
             self.backbone_end_level = self.num_ins
@@ -193,6 +202,12 @@ class AuxFPN(BaseModule):
             nn.Sigmoid()  # 限制权重范围在 (0,1)
         )
 
+        if lfp_cfg is not None and self.lfp_levels:
+            for level in self.lfp_levels:
+                cfg = dict(lfp_cfg)
+                cfg.setdefault('in_channels', out_channels)
+                self.lfp_modules[str(level)] = LFP(**cfg)
+
     def forward(self, inputs: Tuple[Tensor], meta_inf: List[DetDataSample]) -> Tuple[Tensor]:
         """Forward function.
 
@@ -212,6 +227,11 @@ class AuxFPN(BaseModule):
             lateral_conv(inputs[i + self.start_level])
             for i, lateral_conv in enumerate(self.lateral_convs)
         ]
+
+        for level in self.lfp_levels:
+            level_key = str(level)
+            if level_key in self.lfp_modules:
+                laterals[level] = self.lfp_modules[level_key](laterals[level])
 
         alphas = []
         for idx in range(2):
