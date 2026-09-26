@@ -63,6 +63,13 @@ def parse_args() -> argparse.Namespace:
         "--iou-thr", type=float, default=0.50,
         help="IoU threshold; keep 0.50 for AP50/test.py comparison.",
     )
+    parser.add_argument(
+        "--include-overall", action="store_true",
+        help=(
+            "Also evaluate all collected validation images together and append "
+            "an overall row to the CSV."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -255,6 +262,8 @@ def main() -> None:
     model = init_detector(str(args.config.resolve()), str(args.checkpoint.resolve()),
                           device=args.device)
     groups = defaultdict(lambda: {"images": 0, "predictions": [], "annotations": []})
+    all_predictions = []
+    all_annotations = []
     tested, skipped = 0, 0
     for xml_path in sorted(args.ann_dir.resolve().rglob("*.xml")):
         try:
@@ -284,19 +293,58 @@ def main() -> None:
         groups[key]["images"] += 1
         groups[key]["predictions"].append(prediction)
         groups[key]["annotations"].append(annotation)
+        all_predictions.append(prediction)
+        all_annotations.append(annotation)
         tested += 1
 
     rows = []
     for (view, band_type), data in sorted(groups.items()):
         metrics = official_voc_metrics(data["predictions"], data["annotations"],
                                        classes, args.iou_thr, eval_mode, scale_ranges)
-        rows.append({"view": view, "band_type": band_type,
-                     "image_count": data["images"], **metrics})
+        row = {"view": view, "band_type": band_type,
+               "image_count": data["images"], **metrics}
+        if args.include_overall:
+            row["scope"] = "domain"
+        rows.append(row)
+
+    if args.include_overall:
+        domain_image_count = sum(row["image_count"] for row in rows)
+        domain_gt_count = sum(row["gt_count"] for row in rows)
+        overall_metrics = official_voc_metrics(
+            all_predictions,
+            all_annotations,
+            classes,
+            args.iou_thr,
+            eval_mode,
+            scale_ranges,
+        )
+        if domain_image_count != tested:
+            warnings.warn(
+                "Domain/overall image count mismatch: "
+                f"domain_sum={domain_image_count}, overall={tested}, "
+                f"difference={domain_image_count - tested}."
+            )
+        if domain_gt_count != overall_metrics["gt_count"]:
+            warnings.warn(
+                "Domain/overall GT count mismatch: "
+                f"domain_sum={domain_gt_count}, "
+                f"overall={overall_metrics['gt_count']}, "
+                f"difference={domain_gt_count - overall_metrics['gt_count']}."
+            )
+        rows.append({
+            "scope": "overall",
+            "view": "ALL",
+            "band_type": "ALL",
+            "image_count": tested,
+            **overall_metrics,
+        })
 
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     fields = ["view", "band_type", "image_count", "gt_count", "ignored_gt_count",
               "prediction_count", "tp", "fp", "fn", "AP50", "Recall"]
+    if args.include_overall:
+        fields = ["scope"] + fields
     with output.open("w", newline="", encoding="utf-8-sig") as file:
         writer = csv.DictWriter(file, fieldnames=fields)
         writer.writeheader()
@@ -308,7 +356,13 @@ def main() -> None:
           ("none (same as test.py)" if args.score_thr is None else str(args.score_thr)))
     print(f"Images evaluated: {tested}")
     print(f"Skipped: {skipped}")
-    print(f"Groups: {len(rows)}")
+    print(f"Groups: {len(groups)}")
+    if args.include_overall:
+        print("Overall evaluation: included")
+        print(
+            f"Overall: AP50={rows[-1]['AP50']:.3f}, "
+            f"Recall={rows[-1]['Recall']:.3f}"
+        )
     print(f"Report: {output}")
     for row in rows:
         print(f"{row['view']}/{row['band_type']}: AP50={row['AP50']:.3f}, "
