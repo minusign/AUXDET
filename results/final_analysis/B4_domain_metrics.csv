@@ -1,0 +1,7 @@
+﻿scope,view,band_type,image_count,gt_count,ignored_gt_count,prediction_count,tp,fp,fn,AP50,Recall
+domain,Air,LWIR,356,505,0,1562,500,1062,5,0.982,0.99
+domain,Land,LWIR,378,548,0,3278,498,2780,50,0.864,0.909
+domain,Space,LWIR,21,49,0,826,29,797,20,0.325,0.592
+domain,Space,NIR,1237,3745,0,32662,3149,29513,596,0.713,0.841
+domain,Space,SWIR,8,37,0,245,34,211,3,0.719,0.919
+overall,ALL,ALL,2000,4884,0,38573,4210,34363,674,0.763,0.862
