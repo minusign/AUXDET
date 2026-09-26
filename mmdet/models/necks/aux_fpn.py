@@ -14,6 +14,7 @@ from einops import rearrange
 from mmdet.models.utils import DMLPAttention, FCResLayer
 from mmdet.structures import DetDataSample
 from .lfp import LFP
+from .sfs import SpiralAwareCrossDeformAttn2D
 
 
 @MODELS.register_module()
@@ -91,6 +92,8 @@ class AuxFPN(BaseModule):
             lfp_cfg: OptConfigType = None,
             lfp_levels: Tuple[int, ...] = (),
             lfp_position: str = 'before_modulation',
+            sfs_cfg: OptConfigType = None,
+            sfs_fusions: Tuple[int, ...] = (),
     ) -> None:
         super().__init__(init_cfg=init_cfg)
         assert isinstance(in_channels, list)
@@ -113,6 +116,13 @@ class AuxFPN(BaseModule):
                 f'lfp_levels must be within [0, {self.num_ins}), '
                 f'got {self.lfp_levels}')
         self.lfp_modules = nn.ModuleDict()
+        self.sfs_fusions = tuple(sfs_fusions)
+        if any(level < 0 or level >= self.num_ins - 1
+               for level in self.sfs_fusions):
+            raise ValueError(
+                f'sfs_fusions must be within [0, {self.num_ins - 1}), '
+                f'got {self.sfs_fusions}')
+        self.sfs_modules = nn.ModuleDict()
 
         if end_level == -1 or end_level == self.num_ins - 1:
             self.backbone_end_level = self.num_ins
@@ -213,6 +223,11 @@ class AuxFPN(BaseModule):
                 cfg = dict(lfp_cfg)
                 cfg.setdefault('in_channels', out_channels)
                 self.lfp_modules[str(level)] = LFP(**cfg)
+        if sfs_cfg is not None and self.sfs_fusions:
+            for level in self.sfs_fusions:
+                cfg = dict(sfs_cfg)
+                cfg.setdefault('dim', out_channels)
+                self.sfs_modules[str(level)] = SpiralAwareCrossDeformAttn2D(**cfg)
 
     def forward(self, inputs: Tuple[Tensor], meta_inf: List[DetDataSample]) -> Tuple[Tensor]:
         """Forward function.
@@ -288,7 +303,10 @@ class AuxFPN(BaseModule):
         for i in range(used_backbone_levels - 1, 0, -1):
             # In some cases, fixing `scale factor` (e.g. 2) is preferred, but
             #  it cannot co-exist with `size` in `F.interpolate`.
-            if 'scale_factor' in self.upsample_cfg:
+            if (i - 1) in self.sfs_fusions:
+                laterals[i - 1] = self.sfs_modules[str(i - 1)](
+                    laterals[i - 1], laterals[i])
+            elif 'scale_factor' in self.upsample_cfg:
                 # fix runtime error of "+=" inplace operation in PyTorch 1.10
                 laterals[i - 1] = laterals[i - 1] + F.interpolate(
                     laterals[i], **self.upsample_cfg)
