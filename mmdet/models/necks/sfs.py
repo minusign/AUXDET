@@ -117,12 +117,10 @@ class SpiralAwareCrossDeformAttn2D(nn.Module):
 
         query_feat = self.query_conv(query_feat)
         key_feat = self.key_conv(key_feat)
-        query = self.query_norm(
-            query_feat.flatten(2).transpose(1, 2)
-        )
-        key = self.key_norm(
-            key_feat.flatten(2).transpose(1, 2)
-        )
+        query_tokens = query_feat.flatten(2).transpose(1, 2).contiguous()
+        key_tokens = key_feat.flatten(2).transpose(1, 2).contiguous()
+        query = self.query_norm(query_tokens)
+        key = self.key_norm(key_tokens)
 
         spatial_shapes = query.new_tensor(
             [[h_key, w_key]], dtype=torch.long
@@ -165,16 +163,16 @@ class SpiralAwareCrossDeformAttn2D(nn.Module):
             1, h_query * w_query, 1, 2
         ).expand(batch, -1, -1, -1)
 
-        value = self.value_proj(key).view(
+        value = self.value_proj(key).reshape(
             batch,
             h_key * w_key,
             self.n_heads,
             self.dim // self.n_heads,
-        )
+        ).contiguous()
         attention_weights = self.attention_weights(query).view(
             batch, h_query * w_query, self.n_heads, self.n_points
         )
-        attention_weights = attention_weights.softmax(dim=-1).unsqueeze(3)
+        attention_weights = attention_weights.softmax(dim=-1).unsqueeze(3).contiguous()
 
         offset_normalizer = torch.stack(
             [spatial_shapes[..., 1], spatial_shapes[..., 0]], dim=-1
@@ -195,6 +193,5 @@ class SpiralAwareCrossDeformAttn2D(nn.Module):
         )
         sampled = self.output_proj(sampled)
         out = query + query * sampled
-        return self.out_norm(out).transpose(1, 2).reshape(
-            batch, channels, h_query, w_query
-        )
+        out = self.out_norm(out).transpose(1, 2).contiguous()
+        return out.reshape(batch, channels, h_query, w_query).contiguous()
