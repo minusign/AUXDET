@@ -1,373 +1,167 @@
 #!/usr/bin/env python3
-"""Evaluate AP50 and Recall by ``(view, band_type)`` with VOCMetric logic.
-
-This script follows the same evaluation path as ``tools/test.py`` for this
-project: ``VOCMetric -> eval_map``. It uses the configured ``eval_mode``, VOC
-legacy box coordinates, model test-time outputs, and the XML ``difficult``
-flag as ignored ground truth.
-
-The Recall column is the final recall reported by the official VOC evaluator
-at IoU 0.50. AP50 is rounded to three decimals, as in VOCMetric.
-
-Example::
-
-    python tools/auxdet_tools/06_ap50_recall_by_view_band.py \
-        --config configs/auxdet/auxdet_r50_fpn_1x_voc.py \
-        --checkpoint work_dirs/auxdet/latest.pth \
-        --ann-dir data_root/VOC2007/Annotations \
-        --image-dir data_root/VOC2007/PNGImages \
-        --id-list data_root/VOC2007/ImageSets/Main/val.txt \
-        --output data_root/VOC2007/ap50_recall_by_view_band.csv \
-        --device cuda:0
-
-Omit ``--score-thr`` when comparing with ``tools/test.py``. This leaves the
-model's own ``test_cfg.rcnn.score_thr`` in control, exactly as test.py does.
-"""
-
+"""Official VOC evaluation from tools/test.py --out, or the official dataloader."""
 from __future__ import annotations
 
 import argparse
-import csv
-import importlib.util
-import warnings
-import xml.etree.ElementTree as ET
-from collections import defaultdict
+import json
 from pathlib import Path
-from typing import Optional
+
+from eval_common import (PROJECT, attach_predictions, data_arguments, evaluate,
+                         file_info, groups, load_dataset, load_prediction_file,
+                         write_csv, write_json)
 
 
-def parse_args() -> argparse.Namespace:
+def parity_report(metrics, path=None, step=None, decimals=3):
+    report = {"internal_official_matcher": "pass", "status": "not_requested",
+              "checks": {}, "note": "Recall is final detection recall, not recall@N proposals."}
+    if path is None:
+        return report
+    text = Path(path).read_text(encoding="utf-8-sig")
+    try:
+        payload = json.loads(text)
+        candidates = payload if isinstance(payload, list) else [payload]
+    except json.JSONDecodeError:
+        candidates = [json.loads(line) for line in text.splitlines() if line.strip()]
+    def flattened(row):
+        for key in ("metrics", "metric"):
+            if isinstance(row.get(key), dict):
+                return {**row, **row[key]}
+        return row
+    candidates = [flattened(row) for row in candidates if isinstance(row, dict)]
+    candidates = [row for row in candidates
+                  if any(key.split("/")[-1] in ("AP50", "mAP") for key in row)
+                  and (step is None or row.get("step", row.get("epoch")) == step)]
+    if len(candidates) != 1:
+        raise ValueError("Identify one official evaluation with --official-step or a single-result JSON")
+    reference = {key.split("/")[-1]: value for key, value in candidates[0].items()}
+    if "AP50" not in reference and "mAP" in reference:
+        reference["AP50"] = reference["mAP"]
+        report["ap_reference"] = "mAP (single IoU=0.5)"
+    else:
+        report["ap_reference"] = "AP50"
+    for key in ("AP50", "Recall", "gt_count"):
+        if key not in reference:
+            report["checks"][key] = {"status": "unavailable"}
+            continue
+        expected = float(reference[key])
+        if key != "gt_count" and not 0 <= expected <= 1:
+            raise ValueError("Official AP/Recall must be fractions, not percentages")
+        actual = metrics[key]
+        tolerance = 0 if key == "gt_count" else 0.5 * 10 ** (-decimals) + 1e-8
+        if key == "AP50" and report["ap_reference"].startswith("mAP"):
+            tolerance = 1e-6
+        passed = actual is not None and abs(actual-expected) <= tolerance
+        report["checks"][key] = dict(status="pass" if passed else "fail",
+                                      actual=actual, reference=expected,
+                                      difference=None if actual is None else actual-expected,
+                                      tolerance=tolerance)
+    statuses = [row["status"] for row in report["checks"].values()]
+    report["status"] = "fail" if "fail" in statuses else ("partial" if "unavailable" in statuses else "pass")
+    report["reference"] = file_info(path)
+    return report
+
+
+def official_online(data, checkpoint, device):
+    import sys
+    sys.path.insert(0, str(PROJECT))
+    import torch
+    from mmengine.evaluator.metric import _to_cpu
+    from mmengine.runner import Runner
+    from mmdet.apis import init_detector
+    from mmdet.utils import register_all_modules
+    register_all_modules()
+    cfg = data.config.copy()
+    settings = cfg.test_dataloader.dataset
+    settings.data_root = ""
+    settings.data_prefix = dict(sub_data_root="")
+    settings.ann_file = data.metadata["id_list"]["path"]
+    settings.img_subdir = data.metadata["image_dir"]
+    settings.ann_subdir = data.metadata["ann_dir"]
+    cfg.test_dataloader.num_workers = 0
+    cfg.test_dataloader.persistent_workers = False
+    loader = Runner.build_dataloader(cfg.test_dataloader)
+    model = init_detector(cfg, str(checkpoint), device=device)
+    predictions = []
+    with torch.no_grad():
+        for batch in loader:
+            for sample in model.test_step(batch):
+                item = sample.to_dict() if hasattr(sample, "to_dict") else sample
+                for key in ("gt_instances", "ignored_instances"):
+                    item.pop(key, None)
+                predictions.append(_to_cpu(item))
+    return predictions
+
+
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument(
-        "--ann-dir", type=Path, default=Path("data_root/VOC2007/Annotations")
-    )
-    parser.add_argument(
-        "--image-dir", type=Path, default=Path("data_root/VOC2007/PNGImages")
-    )
-    parser.add_argument(
-        "--id-list", type=Path, default=None,
-        help="Optional train/val ID list; pass val.txt to match test.py exactly.",
-    )
-    parser.add_argument(
-        "--output", type=Path,
-        default=Path("data_root/VOC2007/ap50_recall_by_view_band.csv"),
-    )
+    parser.add_argument("--predictions", type=Path)
+    parser.add_argument("--checkpoint", type=Path, help="Required online; provenance only in cache mode")
+    parser.add_argument("--save-predictions", type=Path)
+    parser.add_argument("--model", default="model")
+    parser.add_argument("--data-root", type=Path)
+    parser.add_argument("--id-list", type=Path)
+    parser.add_argument("--ann-dir", type=Path)
+    parser.add_argument("--image-dir", type=Path)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument(
-        "--score-thr", type=float, default=None,
-        help="Optional extra filter. Omit it to use model test_cfg, like test.py.",
-    )
-    parser.add_argument(
-        "--iou-thr", type=float, default=0.50,
-        help="IoU threshold; keep 0.50 for AP50/test.py comparison.",
-    )
-    parser.add_argument(
-        "--include-overall", action="store_true",
-        help=(
-            "Also evaluate all collected validation images together and append "
-            "an overall row to the CSV."
-        ),
-    )
-    return parser.parse_args()
-
-
-def load_helpers():
-    helper_path = Path(__file__).with_name("04_extract_mismatches.py")
-    spec = importlib.util.spec_from_file_location("auxdet_mismatch_helpers", helper_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load helper: {helper_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def unwrap_dataset_cfg(dataset_cfg):
-    while "dataset" in dataset_cfg:
-        dataset_cfg = dataset_cfg["dataset"]
-    if "datasets" in dataset_cfg and dataset_cfg["datasets"]:
-        return unwrap_dataset_cfg(dataset_cfg["datasets"][0])
-    return dataset_cfg
-
-
-def resolve_evaluator(config):
-    evaluator = config.get("test_evaluator", {})
+    parser.add_argument("--score-thr", type=float)
+    parser.add_argument("--iou-thr", type=float, default=0.5)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--output", type=Path, help="Also write the previous combined CSV")
+    parser.add_argument("--include-overall", action="store_true")
+    parser.add_argument("--official-metrics", type=Path)
+    parser.add_argument("--official-step", type=int)
+    parser.add_argument("--reference-decimals", type=int, default=3)
+    parser.add_argument("--require-parity", action="store_true")
+    args = parser.parse_args()
+    if args.iou_thr != 0.5 or args.reference_decimals < 0:
+        parser.error("Require IoU=0.5 and nonnegative reference decimals")
+    if not args.predictions and not args.checkpoint:
+        parser.error("Provide --predictions or --checkpoint for official online inference")
+    kwargs = data_arguments(args)
+    kwargs.pop("score_thr")
+    kwargs.pop("iou_thr")
+    data = load_dataset(args.config, **kwargs)
+    evaluator = data.config.test_evaluator
     if isinstance(evaluator, (list, tuple)):
-        for item in evaluator:
-            if item.get("type") == "VOCMetric":
-                return item
-        return evaluator[0] if evaluator else {}
-    return evaluator
-
-
-def resolve_id_list(args: argparse.Namespace, dataset_cfg) -> Optional[Path]:
-    if args.id_list is not None:
-        path = args.id_list.resolve()
-        if not path.is_file():
-            raise FileNotFoundError(f"ID list does not exist: {path}")
-        return path
-    ann_file = dataset_cfg.get("ann_file")
-    if not ann_file:
-        return None
-    ann_file = Path(str(ann_file))
-    candidates = [Path.cwd() / ann_file]
-    data_root = dataset_cfg.get("data_root")
-    if data_root:
-        candidates.append(Path(str(data_root)) / ann_file)
-    candidates.append(args.ann_dir.resolve().parent / "ImageSets" / "Main" / ann_file.name)
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate.resolve()
-    warnings.warn(f"Could not find configured ann_file {ann_file}; using all XML files.")
-    return None
-
-
-def class_names(dataset_cfg) -> tuple[str, ...]:
-    classes = dataset_cfg.get("metainfo", {}).get("classes", ("Target",))
-    return (classes,) if isinstance(classes, str) else tuple(classes)
-
-
-def parse_annotation(root: ET.Element, classes: tuple[str, ...]):
-    """Build the exact annotation shape consumed by VOCMetric.eval_map."""
-    import numpy as np
-
-    class_to_label = {name: index for index, name in enumerate(classes)}
-    boxes, labels, ignored_boxes, ignored_labels = [], [], [], []
-    for obj in root.findall("object"):
-        name = obj.findtext("name", default="").strip()
-        if name not in class_to_label:
-            continue
-        bbox = obj.find("bndbox")
-        if bbox is None:
-            continue
-        try:
-            coords = [int(float(bbox.findtext(key))) for key in
-                      ("xmin", "ymin", "xmax", "ymax")]
-        except (TypeError, ValueError):
-            warnings.warn("Malformed XML bndbox skipped.")
-            continue
-        difficult = int(obj.findtext("difficult", default="0") or 0)
-        if difficult:
-            ignored_boxes.append(coords)
-            ignored_labels.append(class_to_label[name])
-        else:
-            boxes.append(coords)
-            labels.append(class_to_label[name])
-    return {
-        "bboxes": np.asarray(boxes, dtype=np.float32).reshape(-1, 4),
-        "labels": np.asarray(labels, dtype=np.int64),
-        "bboxes_ignore": np.asarray(ignored_boxes, dtype=np.float32).reshape(-1, 4),
-        "labels_ignore": np.asarray(ignored_labels, dtype=np.int64),
-    }
-
-
-def parse_predictions(result, class_count: int, extra_score_thr: Optional[float]):
-    """Convert model output to VOCMetric's per-class [x1,y1,x2,y2,score]."""
-    import numpy as np
-
-    pred = getattr(result, "pred_instances", None)
-    if pred is None or not hasattr(pred, "bboxes"):
-        return [np.empty((0, 5), dtype=np.float32) for _ in range(class_count)]
-    bboxes = pred.bboxes.detach().cpu().numpy()
-    scores = pred.scores.detach().cpu().numpy()
-    labels = pred.labels.detach().cpu().numpy()
-    output = []
-    for label in range(class_count):
-        keep = labels == label
-        if extra_score_thr is not None:
-            keep &= scores >= extra_score_thr
-        output.append(np.hstack((bboxes[keep], scores[keep, None])).astype(np.float32))
-    return output
-
-
-def official_voc_metrics(predictions, annotations, classes, iou_thr, eval_mode,
-                         scale_ranges):
-    """Call exactly the function used by mmdet/evaluation/metrics/voc_metric.py."""
-    from mmdet.evaluation.functional import eval_map
-
-    mean_ap, class_results = eval_map(
-        predictions,
-        annotations,
-        scale_ranges=scale_ranges,
-        iou_thr=iou_thr,
-        dataset=classes,
-        logger="silent",
-        eval_mode=eval_mode,
-        use_legacy_coordinate=True,
-    )
-    gt_count = sum(len(item["bboxes"]) for item in annotations)
-    ignored_gt_count = sum(len(item["bboxes_ignore"]) for item in annotations)
-    prediction_count = sum(sum(len(cls) for cls in image) for image in predictions)
-
-    # VOCMetric's eval_map result contains class-level cumulative curves. The
-    # last point gives the official final recall at this IoU threshold.
-    tp = 0
-    fp = 0
-    for result in class_results:
-        recalls = result["recall"]
-        precisions = result["precision"]
-        final_recall = float(recalls[-1]) if getattr(recalls, "size", 0) else 0.0
-        final_precision = float(precisions[-1]) if getattr(precisions, "size", 0) else 0.0
-        class_gts = int(result["num_gts"])
-        class_dets = int(result["num_dets"])
-        class_tp = int(round(final_recall * class_gts))
-        class_fp = int(round(class_tp / final_precision - class_tp)) if final_precision > 0 else class_dets
-        tp += class_tp
-        fp += max(0, class_fp)
-    recall = tp / gt_count if gt_count else 0.0
-    return {
-        "AP50": round(float(mean_ap), 3),
-        "Recall": round(float(recall), 3),
-        "gt_count": gt_count,
-        "ignored_gt_count": ignored_gt_count,
-        "prediction_count": prediction_count,
-        "tp": tp,
-        "fp": fp,
-        "fn": gt_count - tp,
-    }
-
-
-def main() -> None:
-    args = parse_args()
-    for path, name in ((args.config, "config"), (args.checkpoint, "checkpoint"),
-                       (args.ann_dir, "annotation directory"),
-                       (args.image_dir, "image directory")):
-        if not path.exists():
-            raise FileNotFoundError(f"{name} does not exist: {path.resolve()}")
-    if not 0.0 < args.iou_thr <= 1.0:
-        raise ValueError("--iou-thr must be in (0, 1]")
-
-    try:
-        from mmengine.config import Config
-        from mmdet.apis import init_detector
-    except ImportError as exc:
-        raise RuntimeError("Run this script in the MMDetection environment.") from exc
-
-    config = Config.fromfile(str(args.config.resolve()))
-    dataset_cfg = unwrap_dataset_cfg(config.test_dataloader.dataset)
-    evaluator = resolve_evaluator(config)
-    if evaluator.get("type", "VOCMetric") != "VOCMetric":
-        raise ValueError("test_evaluator must be VOCMetric to match tools/test.py.")
-    eval_mode = evaluator.get("eval_mode", "11points")
-    scale_ranges = evaluator.get("scale_ranges", None)
-    classes = class_names(dataset_cfg)
-    id_list = resolve_id_list(args, dataset_cfg)
-    selected_ids = None
-    if id_list is not None:
-        selected_ids = {Path(line.strip()).stem for line in
-                        id_list.read_text(encoding="utf-8").splitlines() if line.strip()}
-
-    helpers = load_helpers()
-    model = init_detector(str(args.config.resolve()), str(args.checkpoint.resolve()),
-                          device=args.device)
-    groups = defaultdict(lambda: {"images": 0, "predictions": [], "annotations": []})
-    all_predictions = []
-    all_annotations = []
-    tested, skipped = 0, 0
-    for xml_path in sorted(args.ann_dir.resolve().rglob("*.xml")):
-        try:
-            root = ET.parse(xml_path).getroot()
-        except ET.ParseError as exc:
-            warnings.warn(f"Invalid XML {xml_path}: {exc}; skipped.")
-            skipped += 1
-            continue
-        image_id = helpers.stem(root, xml_path)
-        if selected_ids is not None and image_id not in selected_ids:
-            continue
-        image_path = helpers.find_image(args.image_dir.resolve(), image_id)
-        if image_path is None:
-            warnings.warn(f"Image not found for {image_id}; skipped.")
-            skipped += 1
-            continue
-        try:
-            result = helpers.detector_inference(model, image_path, root)
-            annotation = parse_annotation(root, classes)
-            prediction = parse_predictions(result, len(classes), args.score_thr)
-        except Exception as exc:
-            warnings.warn(f"Evaluation failed for {image_id}: {exc}")
-            skipped += 1
-            continue
-        key = (helpers.text(root.find("view"), "Unknown"),
-               helpers.text(root.find("band_type"), "Unknown"))
-        groups[key]["images"] += 1
-        groups[key]["predictions"].append(prediction)
-        groups[key]["annotations"].append(annotation)
-        all_predictions.append(prediction)
-        all_annotations.append(annotation)
-        tested += 1
-
+        evaluator = next(v for v in evaluator if v.get("type") == "VOCMetric")
+    if evaluator.get("iou_thrs", [0.5]) not in (0.5, [0.5], (0.5,)):
+        parser.error("Use a VOCMetric configured for only IoU=0.5")
+    if args.predictions:
+        payload = load_prediction_file(args.predictions)
+    else:
+        payload = official_online(data, args.checkpoint, args.device)
+        if args.save_predictions:
+            import pickle
+            args.save_predictions.parent.mkdir(parents=True, exist_ok=True)
+            with args.save_predictions.open("wb") as stream:
+                pickle.dump(payload, stream)
+    attach_predictions(data, payload, args.predictions or args.save_predictions,
+                       score_thr=args.score_thr, iou_thr=args.iou_thr, checkpoint=args.checkpoint)
     rows = []
-    for (view, band_type), data in sorted(groups.items()):
-        metrics = official_voc_metrics(data["predictions"], data["annotations"],
-                                       classes, args.iou_thr, eval_mode, scale_ranges)
-        row = {"view": view, "band_type": band_type,
-               "image_count": data["images"], **metrics}
-        if args.include_overall:
-            row["scope"] = "domain"
-        rows.append(row)
-
-    if args.include_overall:
-        domain_image_count = sum(row["image_count"] for row in rows)
-        domain_gt_count = sum(row["gt_count"] for row in rows)
-        overall_metrics = official_voc_metrics(
-            all_predictions,
-            all_annotations,
-            classes,
-            args.iou_thr,
-            eval_mode,
-            scale_ranges,
-        )
-        if domain_image_count != tested:
-            warnings.warn(
-                "Domain/overall image count mismatch: "
-                f"domain_sum={domain_image_count}, overall={tested}, "
-                f"difference={domain_image_count - tested}."
-            )
-        if domain_gt_count != overall_metrics["gt_count"]:
-            warnings.warn(
-                "Domain/overall GT count mismatch: "
-                f"domain_sum={domain_gt_count}, "
-                f"overall={overall_metrics['gt_count']}, "
-                f"difference={domain_gt_count - overall_metrics['gt_count']}."
-            )
-        rows.append({
-            "scope": "overall",
-            "view": "ALL",
-            "band_type": "ALL",
-            "image_count": tested,
-            **overall_metrics,
-        })
-
-    output = args.output.resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fields = ["view", "band_type", "image_count", "gt_count", "ignored_gt_count",
-              "prediction_count", "tp", "fp", "fn", "AP50", "Recall"]
-    if args.include_overall:
-        fields = ["scope"] + fields
-    with output.open("w", newline="", encoding="utf-8-sig") as file:
-        writer = csv.DictWriter(file, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(rows)
-
-    print(f"Evaluation path: VOCMetric -> eval_map ({eval_mode})")
-    print(f"Image ID list: {id_list if id_list else 'all existing XML files'}")
-    print("Extra score filter: " +
-          ("none (same as test.py)" if args.score_thr is None else str(args.score_thr)))
-    print(f"Images evaluated: {tested}")
-    print(f"Skipped: {skipped}")
-    print(f"Groups: {len(groups)}")
-    if args.include_overall:
-        print("Overall evaluation: included")
-        print(
-            f"Overall: AP50={rows[-1]['AP50']:.3f}, "
-            f"Recall={rows[-1]['Recall']:.3f}"
-        )
-    print(f"Report: {output}")
-    for row in rows:
-        print(f"{row['view']}/{row['band_type']}: AP50={row['AP50']:.3f}, "
-              f"Recall={row['Recall']:.3f}")
+    for scope, view, band, images in groups(data):
+        metrics = evaluate(images, data.classes, args.iou_thr, data.metadata["protocol"]["eval_mode"])
+        rows.append(dict(model=args.model, evaluation_id=data.metadata["evaluation_id"],
+                         scope=scope, view=view, band_type=band, **metrics))
+    overall, domains = rows[0], rows[1:]
+    for key in ("image_count", "gt_count", "tp", "fp", "fn", "ignored_prediction_count"):
+        if sum(row[key] for row in domains) != overall[key]:
+            raise AssertionError(f"Domain sum != overall: {key}")
+    parity = parity_report(overall, args.official_metrics, args.official_step, args.reference_decimals)
+    output = args.output_dir or (args.output.parent / args.output.stem if args.output else
+                                 Path("results/ablation") / args.model)
+    write_csv(output / "overall_metrics.csv", [overall])
+    write_csv(output / "domain_metrics.csv", domains)
+    write_json(output / "parity_report.json", parity)
+    data.metadata.update(model=args.model, parity_status=parity["status"])
+    write_json(output / "evaluation_metadata.json", data.metadata)
+    if args.output:
+        write_csv(args.output, rows if args.include_overall else domains)
+    print(f"{args.model}: AP50={overall['AP50']:.6f}, Recall={overall['Recall']}, "
+          f"GT={overall['gt_count']}, parity={parity['status']}")
+    print(f"Reports: {output.resolve()}")
+    return int(parity["status"] == "fail" or (args.require_parity and parity["status"] != "pass"))
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

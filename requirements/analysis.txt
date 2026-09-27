@@ -1,0 +1,8 @@
+numpy
+mmengine>=0.7.1,<1.0.0
+terminaltables
+Pillow
+matplotlib
+# Torch is required for reading official caches containing torch tensors.
+# Retain the Torch/MMCV versions used for training. For an isolated CPU-only
+# environment, install torch and mmcv-lite separately; never combine mmcv and mmcv-lite.

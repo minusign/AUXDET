@@ -159,6 +159,14 @@ Please download it and specify the path to `"best.pth"` in the command above.
 | PConv                          | AAAI<sup>25</sup>    | -                    | 0.012T  | 2.922M    | 71.7                  | 64.5         |
 | **AuxDet (Ours)**              | -                    | ResNet50             | 0.215T  | 45.279M   | **77.9**              | **87.2**     |
 
+## 消融实验评测与分析
+
+新增官方预测缓存评测、目标尺度 Recall、逐图/逐目标预测对比、CUDA 成本测量和多 seed 汇总工具。
+完整使用情境、输入要求、命令和验证范围见：
+[AuxDet / NS-FPN 消融实验工具使用报告](/Users/aaash/Documents/2026夏/AUXDET/AUXDET/docs/zh_cn/auxdet_ablation_tools.md)。
+
+可选依赖为 requirements/nsfpn.txt 和 requirements/analysis.txt；实验来源通过 experiment_manifest.example.csv 模板记录。
+
 ## 🔖 Citation
 
 ------
@@ -171,4 +179,3 @@ Please download it and specify the path to `"best.pth"` in the command above.
 	journal={arXiv preprint arXiv:2505.15184},
 }
 ```
-

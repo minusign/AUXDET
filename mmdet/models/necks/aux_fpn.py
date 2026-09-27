@@ -106,6 +106,8 @@ class AuxFPN(BaseModule):
         self.fp16_enabled = False
         self.upsample_cfg = upsample_cfg.copy()
         self.lfp_levels = tuple(lfp_levels)
+        if bool(self.lfp_levels) != (lfp_cfg is not None):
+            raise ValueError('lfp_cfg and non-empty lfp_levels must be provided together')
         if lfp_position not in ('before_modulation', 'after_edge'):
             raise ValueError(
                 "lfp_position must be 'before_modulation' or 'after_edge', "
@@ -117,6 +119,8 @@ class AuxFPN(BaseModule):
                 f'got {self.lfp_levels}')
         self.lfp_modules = nn.ModuleDict()
         self.sfs_fusions = tuple(sfs_fusions)
+        if bool(self.sfs_fusions) != (sfs_cfg is not None):
+            raise ValueError('sfs_cfg and non-empty sfs_fusions must be provided together')
         if any(level < 0 or level >= self.num_ins - 1
                for level in self.sfs_fusions):
             raise ValueError(

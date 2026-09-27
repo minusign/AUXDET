@@ -1,0 +1,35 @@
+{
+  "lfp_levels_without_cfg": {
+    "lfp_modules": [],
+    "sfs_modules": [],
+    "forward": "completed without the requested module"
+  },
+  "sfs_fusions_without_cfg": {
+    "lfp_modules": [],
+    "sfs_modules": [],
+    "forward": "KeyError: '0'"
+  },
+  "lfp_cfg_without_levels": {
+    "lfp_modules": [],
+    "sfs_modules": [],
+    "forward": "completed without the requested module"
+  },
+  "sfs_cfg_without_fusions": {
+    "lfp_modules": [],
+    "sfs_modules": [],
+    "forward": "completed without the requested module"
+  },
+  "large_lfp": {
+    "shape": [
+      1,
+      256,
+      256,
+      256
+    ],
+    "input_gradient": 3.8270056279543496e-07,
+    "parameter_gradients": {
+      "attention.conv.weight": 7.35959765734151e-05,
+      "gaussian_filter.sigma": 9.094441338675097e-06
+    }
+  }
+}
