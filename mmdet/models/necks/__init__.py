@@ -21,11 +21,13 @@ from .yolox_pafpn import YOLOXPAFPN
 from .aux_fpn import AuxFPN
 from .lfp import LFP
 from .sfs import SpiralAwareCrossDeformAttn2D
+from .mlc import LocalContrastMLC, directional_dlc
 
 __all__ = [
     'FPN', 'BFP', 'ChannelMapper', 'HRFPN', 'NASFPN', 'FPN_CARAFE', 'PAFPN',
     'NASFCOS_FPN', 'RFP', 'YOLOV3Neck', 'FPG', 'DilatedEncoder',
     'CTResNetNeck', 'SSDNeck', 'YOLOXPAFPN', 'DyHead', 'CSPNeXtPAFPN', 'SSH',
     'FPN_DropBlock',
-    'AuxFPN', 'LFP', 'SpiralAwareCrossDeformAttn2D'
+    'AuxFPN', 'LFP', 'SpiralAwareCrossDeformAttn2D', 'LocalContrastMLC',
+    'directional_dlc'
 ]

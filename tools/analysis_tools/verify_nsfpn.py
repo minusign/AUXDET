@@ -69,6 +69,16 @@ def definitions(path, names, namespace):
 
 
 def load_modules(backend):
+    # Multiple focused test files can share this source-loading helper in one
+    # pytest process. Reuse the same backend rather than registering classes
+    # again. Different backends must run in separate processes.
+    cached = sys.modules.get('mmdet.models.necks.aux_fpn')
+    if cached is not None and hasattr(cached, '_verification_backend'):
+        if cached._verification_backend != backend:
+            raise RuntimeError('Run different verification backends in separate processes')
+        return (sys.modules['mmdet.models.necks.lfp'],
+                sys.modules['mmdet.models.necks.sfs'], cached,
+                sys.modules['mmdet.structures'].DetDataSample)
     sys.path.insert(0, str(ROOT))
     if backend == 'cuda':
         if not torch.cuda.is_available():
@@ -105,6 +115,7 @@ def load_modules(backend):
 
     lfp = importlib.import_module('mmdet.models.necks.lfp')
     aux = importlib.import_module('mmdet.models.necks.aux_fpn')
+    aux._verification_backend = backend
     from mmdet.structures import DetDataSample
     return lfp, sfs, aux, DetDataSample
 

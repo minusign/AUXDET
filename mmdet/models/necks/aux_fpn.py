@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,6 +16,7 @@ from mmdet.models.utils import DMLPAttention, FCResLayer
 from mmdet.structures import DetDataSample
 from .lfp import LFP
 from .sfs import SpiralAwareCrossDeformAttn2D
+from .mlc import LocalContrastMLC
 
 
 class ConditionalLFPGate(nn.Module):
@@ -168,6 +170,7 @@ class AuxFPN(BaseModule):
             sfs_cfg: OptConfigType = None,
             sfs_fusions: Tuple[int, ...] = (),
             lfp_gate_cfg: OptConfigType = None,
+            mlc_cfg: OptConfigType = None,
     ) -> None:
         super().__init__(init_cfg=init_cfg)
         assert isinstance(in_channels, list)
@@ -193,6 +196,7 @@ class AuxFPN(BaseModule):
                 f'got {self.lfp_levels}')
         self.lfp_modules = nn.ModuleDict()
         self.lfp_gates = nn.ModuleDict()
+        self.mlc_modules = nn.ModuleDict()
         self.sfs_fusions = tuple(sfs_fusions)
         if bool(self.sfs_fusions) != (sfs_cfg is not None):
             raise ValueError('sfs_cfg and non-empty sfs_fusions must be provided together')
@@ -219,6 +223,18 @@ class AuxFPN(BaseModule):
             self._lfp_gate_levels = (gate_level,)
         else:
             self._lfp_gate_levels = ()
+        if mlc_cfg is not None:
+            if lfp_cfg is not None or lfp_gate_cfg is not None or sfs_cfg is not None:
+                raise ValueError('Meta-MLC configs must disable LFP, Meta-LFP gate, and SFS')
+            mlc_options = dict(mlc_cfg)
+            mlc_level = int(mlc_options.pop('level', 0))
+            if mlc_level != 0 or start_level != 0:
+                raise ValueError('Meta-MLC currently supports only the P2 lateral level=0')
+            mlc_options.setdefault('channels', out_channels)
+            mlc_options.setdefault('metadata_dim', (out_channels // 2 // 4) * 3)
+            self._mlc_levels = (mlc_level,)
+        else:
+            self._mlc_levels = ()
 
         if end_level == -1 or end_level == self.num_ins - 1:
             self.backbone_end_level = self.num_ins
@@ -321,6 +337,12 @@ class AuxFPN(BaseModule):
                 self.lfp_modules[str(level)] = LFP(**cfg)
         if lfp_gate_cfg is not None:
             self.lfp_gates[str(self._lfp_gate_levels[0])] = ConditionalLFPGate(**gate_cfg)
+        if mlc_cfg is not None:
+            if mlc_options['metadata_dim'] != self.meta_process_with_sem.metadata_dim:
+                raise ValueError('mlc metadata_dim must match the pure metadata encoder')
+            if mlc_options['channels'] != out_channels:
+                raise ValueError('mlc channels must match AuxFPN out_channels')
+            self.mlc_modules[str(self._mlc_levels[0])] = LocalContrastMLC(**mlc_options)
         if sfs_cfg is not None and self.sfs_fusions:
             for level in self.sfs_fusions:
                 cfg = dict(sfs_cfg)
@@ -340,6 +362,7 @@ class AuxFPN(BaseModule):
                 Shape: (Batch_size, Out_channels, H', W').
         """
         assert len(inputs) == len(self.in_channels)
+        self._mlc_sample_stats = {}
 
         # build laterals
         laterals = [
@@ -355,13 +378,23 @@ class AuxFPN(BaseModule):
 
         alphas = []
         aux_features = {}
+        metadata_features = {}
         for idx in range(2):
             # step 1. 获取补偿特征并降维
             sem_comp_fea = self.downsamples[idx](laterals[idx]) - laterals[-1]
             sem_inf = self.sem_gap(sem_comp_fea).flatten(1)
             # step 2. 融合 元数据特征及补偿特征，得到最终辅助特征
-            all_aux_fea = self.meta_process_with_sem(
-                meta_inf, inputs[0].dtype, inputs[0].device, sem_inf)
+            return_metadata = (idx in self._mlc_levels and
+                               self.mlc_modules[str(idx)].mode == 'visual_metadata')
+            metadata_output = self.meta_process_with_sem(
+                meta_inf, inputs[0].dtype, inputs[0].device, sem_inf,
+                return_metadata_features=return_metadata)
+            if return_metadata:
+                all_aux_fea, view_feat, band_feat, size_feat = metadata_output
+                metadata_features[idx] = torch.cat(
+                    [view_feat, band_feat, size_feat], dim=-1)
+            else:
+                all_aux_fea = metadata_output
             # Keep the per-level auxiliary fused feature for optional gates.
             # It already contains the M2DM visual compensation; do not encode
             # metadata a second time for Meta-LFP.
@@ -409,6 +442,21 @@ class AuxFPN(BaseModule):
                             feature, lfp_feature, aux_features[level])
                     else:
                         laterals[level] = lfp_feature
+
+        for level in self._mlc_levels:
+            level_key = str(level)
+            module = self.mlc_modules[level_key]
+            if module.mode == 'visual_metadata' and level not in metadata_features:
+                raise RuntimeError(f'Meta-MLC has no pure metadata feature for level {level}')
+            laterals[level] = module(laterals[level], metadata_features.get(level))
+            stats = module.get_scale_stats()
+            if stats is not None:
+                for row, sample in zip(stats, meta_inf):
+                    row.update(img_id=sample.get('img_id', sample.get('img_path', None)),
+                               view=sample.get('view', None),
+                               band_type=sample.get('band_type', None))
+                # Only detached Python values, never graph-bearing tensors.
+                self._mlc_sample_stats = {level_key: stats}
 
         # build top-down path
         used_backbone_levels = len(laterals)
@@ -465,36 +513,43 @@ class AuxFPN(BaseModule):
                 for level, module in self.lfp_gates.items()
                 if module.get_gate_stats() is not None}
 
+    def get_mlc_scale_stats(self):
+        """Return detached scale-fusion statistics from the latest forward."""
+        import copy
+        return copy.deepcopy(getattr(self, '_mlc_sample_stats', {}))
+
 
 class MetaFeatureProcessorWithSem(nn.Module):
     def __init__(self, channel_outs=256):
         super().__init__()
+        self.metadata_feature_dim = channel_outs // 4
+        self.metadata_dim = self.metadata_feature_dim * 3
         # 视角编码 MLP：3 (one-hot) -> 64
         self.view_mlp = nn.Sequential(
-            nn.Linear(3, channel_outs // 4),
+            nn.Linear(3, self.metadata_feature_dim),
             nn.ReLU(),
-            nn.BatchNorm1d(channel_outs // 4)
+            nn.BatchNorm1d(self.metadata_feature_dim)
         )
 
         # 波段编码 MLP：3 (one-hot) -> 64
         self.band_mlp = nn.Sequential(
-            nn.Linear(3, channel_outs // 4),
+            nn.Linear(3, self.metadata_feature_dim),
             nn.ReLU(),
-            nn.BatchNorm1d(channel_outs // 4)
+            nn.BatchNorm1d(self.metadata_feature_dim)
         )
 
         # 尺寸编码 MLP：6 (sin&cos) -> 64
         self.size_mlp = nn.Sequential(
-            nn.Linear(6, channel_outs // 4),
+            nn.Linear(6, self.metadata_feature_dim),
             nn.ReLU(),
-            nn.BatchNorm1d(channel_outs // 4)
+            nn.BatchNorm1d(self.metadata_feature_dim)
         )
 
         # 语义特征 MLP：6 (sin&cos) -> 64
         self.sem_mlp = nn.Sequential(
-            nn.Linear(channel_outs*2, channel_outs // 4),
+            nn.Linear(channel_outs*2, self.metadata_feature_dim),
             nn.ReLU(),
-            nn.BatchNorm1d(channel_outs // 4)
+            nn.BatchNorm1d(self.metadata_feature_dim)
         )
 
         self.aux_fusion_mlp = FCResLayer(channel_outs//4*3)
@@ -505,7 +560,8 @@ class MetaFeatureProcessorWithSem(nn.Module):
             FCResLayer(channel_outs),
         )
 
-    def forward(self, meta_inf: list, x_dtype: torch.dtype, device: torch.device, sem_inf: torch.Tensor) -> torch.Tensor:
+    def forward(self, meta_inf: list, x_dtype: torch.dtype, device: torch.device,
+                sem_inf: torch.Tensor, return_metadata_features: bool = False):
         """处理元数据并融合补偿特征，生成最终辅助特征
 
         Args:
@@ -514,12 +570,19 @@ class MetaFeatureProcessorWithSem(nn.Module):
             device (torch.device): 目标设备
             sem_inf (torch.Tensor): 语义补偿特征
 
+            return_metadata_features: When true, also return the three encoded
+                metadata branches before semantic compensation is fused.  These
+                branches are pure view/band/size metadata and do not contain
+                ``sem_inf`` or the visual compensation used by ``all_aux_inf``.
+
         Returns:
-            torch.Tensor: 维度为 [batch_size, channel_outs] 的融合特征
+            By default, a tensor of shape ``[batch_size, channel_outs]``.
+            When ``return_metadata_features`` is true, returns
+            ``(all_aux_inf, view_feat, band_feat, size_feat)``.
         """
         # 视角的One-Hot编码 (3维)
         view_one_hot = torch.stack([
-            torch.tensor([1 if sample.view == category else 0
+            torch.tensor([1 if sample.get('view', None) == category else 0
                           for category in ["Air", "Space", "Land"]],
                          device=device, dtype=x_dtype)
             for sample in meta_inf
@@ -527,17 +590,24 @@ class MetaFeatureProcessorWithSem(nn.Module):
 
         # 波段的One-Hot编码 (3维)
         band_one_hot = torch.stack([
-            torch.tensor([1 if sample.band_type == category else 0
+            torch.tensor([1 if sample.get('band_type', None) == category else 0
                           for category in ["LWIR", "NIR", "SWIR"]],
                          device=device, dtype=x_dtype)
             for sample in meta_inf
         ])  # [B,3]
 
         # 尺寸特征计算
-        w = torch.stack([torch.tensor(sample.width, device=device, dtype=x_dtype)
-                         for sample in meta_inf])  # [B]
-        h = torch.stack([torch.tensor(sample.height, device=device, dtype=x_dtype)
-                         for sample in meta_inf])  # [B]
+        sizes = []
+        for sample in meta_inf:
+            shape = sample.get('ori_shape', sample.get('img_shape', None))
+            width = sample.get('width', None if shape is None else shape[1])
+            height = sample.get('height', None if shape is None else shape[0])
+            if (width is None or height is None or
+                    not math.isfinite(width) or not math.isfinite(height) or
+                    width <= 0 or height <= 0):
+                raise ValueError('Metadata needs positive finite width/height or image shape')
+            sizes.append((width, height))
+        w, h = torch.tensor(sizes, device=device, dtype=x_dtype).unbind(dim=1)
         size_features = torch.stack([
             w / 2048.0,
             h / 2048.0,
@@ -563,6 +633,8 @@ class MetaFeatureProcessorWithSem(nn.Module):
         # 元数据特征-补偿特征融合 [B, channel_outs]
         all_aux_inf = self.fusion_mlp(torch.cat([vsb_features, sem_feat], dim=-1))
 
+        if return_metadata_features:
+            return all_aux_inf, view_feat, band_feat, size_feat
         return all_aux_inf
 
 

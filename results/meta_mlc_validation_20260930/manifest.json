@@ -1,0 +1,37 @@
+{
+  "date": "2026-09-30",
+  "repo": "/Users/aaash/Documents/2026夏/AUXDET/AUXDET",
+  "branch": "feature/meta-lfp",
+  "baseline_commit": "a95371c145e38e9a673d47dd94e2f4b564747118",
+  "reference_commit": "5f71be58e2b703505005a75edbdf780647540fee",
+  "environment": {
+    "torch": "2.2.2",
+    "mmengine": "0.10.7",
+    "mmcv-lite": "2.1.0",
+    "pytest": "9.1.1"
+  },
+  "tests": {
+    "passed": 25,
+    "failed": 0,
+    "command": "python -m pytest -o addopts='' -q tests/test_tools/test_meta_mlc.py tests/test_tools/test_meta_lfp_gate.py"
+  },
+  "source_sha256": {
+    "mmdet/models/necks/mlc.py": "4fc7360ddebc612cceb923b7a8dcbdfdd0726a84825f66d44f78560007e2e07f",
+    "mmdet/models/necks/aux_fpn.py": "861362d84e48a14943ad7b7224bbba6572f56608df3030aa04f3a00f53d082f0",
+    "mmdet/models/necks/__init__.py": "38358078fbd5f35cabe50b6efb30e0ef79334102aca14a5f28cf44d2705563ac",
+    "tests/test_tools/test_meta_mlc.py": "75c18424782cfd3365d5db843b97cef948d0722cf0f1cd84938ac7961c2dd189",
+    "tools/analysis_tools/verify_meta_mlc.py": "6dee0a923f3963c76d08555fb749e2f3925ce2b6fa1ae8d9d33b1f6e87551912",
+    "tools/analysis_tools/verify_nsfpn.py": "be9e9e6870a188d3ed45ac59670a15407cdfec946dcac5f962987e5ebb9e56f9",
+    "tools/analysis_tools/export_mlc_scales.py": "229d808393dcbbc2de77b379f1703e33934c122b4f43f80a88e685c1ae2c35d4",
+    "configs/auxdet/auxdet_r50_mlc_p2_original_1x_voc.py": "abdb2dbfe88bf648c193c61b61d4360be410f41150afba2aa25724eb9e13a817",
+    "configs/auxdet/auxdet_r50_mlc_p2_visual_1x_voc.py": "b1f461a6f399e402fbf1821920b339c09daddf833576e24957db9b4e3ebc1144",
+    "configs/auxdet/auxdet_r50_mlc_p2_visual_metadata_1x_voc.py": "69281f715b6c70fd0d5aca1b90f8044eec73287ff2fd9eb1ab6be0b64da0fe13"
+  },
+  "limitations": [
+    "Native registration fails: missing pycocotools; normal model import fails: missing mmcv._ext",
+    "No complete detector build/loss/predict, CUDA or DDP validation",
+    "No dataset/checkpoint/training/evaluation/end-to-end export run",
+    "Official Python functions tested using Torch operator adapter, not MXNet runtime"
+  ],
+  "git_write_operations_performed": false
+}

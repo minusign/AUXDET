@@ -181,3 +181,5 @@ Meta-LFP 最小版本的结构、配置、参数量、checkpoint 兼容性和运
 	journal={arXiv preprint arXiv:2505.15184},
 }
 ```
+
+Meta-MLC 的 ALCNet 算法核查、纯元数据尺度融合、三份对照配置和服务器运行命令见 [Meta-MLC 实验说明](docs/zh_cn/meta_mlc.md)。本轮仅完成代码和小型验证，没有训练性能结论。

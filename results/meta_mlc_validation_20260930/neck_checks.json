@@ -1,0 +1,184 @@
+{
+  "backend": "source",
+  "torch": "2.2.2",
+  "device": "cpu",
+  "modes": {
+    "original": {
+      "config": "configs/auxdet/auxdet_r50_mlc_p2_original_1x_voc.py",
+      "neck_parameters": 6753014,
+      "added_parameters": 66049,
+      "output_shapes": [
+        [
+          2,
+          256,
+          32,
+          24
+        ],
+        [
+          2,
+          256,
+          16,
+          12
+        ]
+      ],
+      "scale_stats": {
+        "0": [
+          {
+            "fusion": "max",
+            "dilations": [
+              1,
+              2,
+              3
+            ],
+            "mean": null,
+            "entropy": null,
+            "img_id": 0,
+            "view": "Air",
+            "band_type": "LWIR"
+          },
+          {
+            "fusion": "max",
+            "dilations": [
+              1,
+              2,
+              3
+            ],
+            "mean": null,
+            "entropy": null,
+            "img_id": 1,
+            "view": "Space",
+            "band_type": "NIR"
+          }
+        ]
+      },
+      "stress_residual_rms": 0.1000627800822258,
+      "other_optional_modules_absent": true
+    },
+    "visual": {
+      "config": "configs/auxdet/auxdet_r50_mlc_p2_visual_1x_voc.py",
+      "neck_parameters": 6769657,
+      "added_parameters": 82692,
+      "output_shapes": [
+        [
+          2,
+          256,
+          32,
+          24
+        ],
+        [
+          2,
+          256,
+          16,
+          12
+        ]
+      ],
+      "scale_stats": {
+        "0": [
+          {
+            "fusion": "softmax_weighted_sum",
+            "dilations": [
+              1,
+              2,
+              3
+            ],
+            "mean": [
+              0.46756860613822937,
+              0.1947958916425705,
+              0.33763548731803894
+            ],
+            "entropy": 0.6894425749778748,
+            "img_id": 0,
+            "view": "Air",
+            "band_type": "LWIR"
+          },
+          {
+            "fusion": "softmax_weighted_sum",
+            "dilations": [
+              1,
+              2,
+              3
+            ],
+            "mean": [
+              0.5015438199043274,
+              0.20368270576000214,
+              0.29477348923683167
+            ],
+            "entropy": 0.7175341248512268,
+            "img_id": 1,
+            "view": "Space",
+            "band_type": "NIR"
+          }
+        ]
+      },
+      "stress_residual_rms": 0.09982745349407196,
+      "other_optional_modules_absent": true
+    },
+    "visual_metadata": {
+      "config": "configs/auxdet/auxdet_r50_mlc_p2_visual_metadata_1x_voc.py",
+      "neck_parameters": 6782364,
+      "added_parameters": 95399,
+      "output_shapes": [
+        [
+          2,
+          256,
+          32,
+          24
+        ],
+        [
+          2,
+          256,
+          16,
+          12
+        ]
+      ],
+      "scale_stats": {
+        "0": [
+          {
+            "fusion": "softmax_weighted_sum",
+            "dilations": [
+              1,
+              2,
+              3
+            ],
+            "mean": [
+              0.14305435121059418,
+              0.3316722810268402,
+              0.5252733826637268
+            ],
+            "entropy": 0.6570139527320862,
+            "img_id": 0,
+            "view": "Air",
+            "band_type": "LWIR"
+          },
+          {
+            "fusion": "softmax_weighted_sum",
+            "dilations": [
+              1,
+              2,
+              3
+            ],
+            "mean": [
+              0.17401276528835297,
+              0.27554354071617126,
+              0.550443708896637
+            ],
+            "entropy": 0.7049729228019714,
+            "img_id": 1,
+            "view": "Space",
+            "band_type": "NIR"
+          }
+        ]
+      },
+      "stress_residual_rms": 0.0997065082192421,
+      "other_optional_modules_absent": true
+    }
+  },
+  "baseline_neck_parameters": 6686965,
+  "default_b0_comparison": {
+    "ref": "HEAD",
+    "max_abs_errors": [
+      0.0,
+      0.0
+    ]
+  }
+}

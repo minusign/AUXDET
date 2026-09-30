@@ -1,0 +1,354 @@
+{
+  "backend": "reference",
+  "device": "cpu",
+  "torch": "2.2.2",
+  "mmcv": "2.1.0",
+  "seed": 20260927,
+  "large": false,
+  "full_model": false,
+  "python": "3.12.14 (main, Aug 25 2026, 13:50:33) [Clang 22.1.3 ]",
+  "dependencies": {
+    "mmengine": "0.10.7",
+    "pytorch-wavelets": "1.3.0",
+    "PyWavelets": "1.10.0",
+    "numpy": "1.26.4",
+    "scipy": "1.13.1",
+    "setuptools": "80.9.0"
+  },
+  "source_sha256": {
+    "mmdet/models/necks/aux_fpn.py": "861362d84e48a14943ad7b7224bbba6572f56608df3030aa04f3a00f53d082f0",
+    "mmdet/models/necks/lfp.py": "5a00f5393c8e4344392db0769a504176a84ab9e53c1d4b416734f603c6749857",
+    "mmdet/models/necks/sfs.py": "dcd800fa59da94f68232cd3df33ad2357d2e9268ca2b945d93ad360a16f012e4",
+    "configs/auxdet/auxdet_r50_fpn_1x_voc.py": "be025127542390e379d30257e2b22463778bfaf5c0a8c20968c624c2038fdb78",
+    "configs/auxdet/auxdet_r50_lfp_p2_1x_voc.py": "c25fe3ba3dbc387de2f7e69f2989d4100c14d32f0246deb708f653f6db09956d",
+    "configs/auxdet/auxdet_r50_lfp_p2_after_edge_1x_voc.py": "9d329ce109388e6a5a4b93724ec77e627f754247e32a70e5dd5e9988fd70f75f",
+    "configs/auxdet/auxdet_r50_sfs_p3_p2_1x_voc.py": "f17c39520ff9fdedd0c01fe6c277d204721dfb94cd70a2088ae9ad5684f1c2fe",
+    "configs/auxdet/auxdet_r50_lfp_after_edge_sfs_p3_p2_1x_voc.py": "9477119a833ebd8442cb571e9b7cc8ad02498b913552d2319da9f3d7a4a1f372"
+  },
+  "results": {
+    "lfp": {
+      "status": "PASS",
+      "details": {
+        "reconstruction": [
+          {
+            "shape": [
+              2,
+              5,
+              31,
+              29
+            ],
+            "max_error": 4.76837158203125e-07
+          },
+          {
+            "shape": [
+              1,
+              256,
+              32,
+              32
+            ],
+            "max_error": 9.5367431640625e-07
+          },
+          {
+            "shape": [
+              2,
+              7,
+              1,
+              3
+            ],
+            "max_error": 1.1920928955078125e-07
+          }
+        ],
+        "forward_backward": [
+          {
+            "with_gauss": false,
+            "gradient_max": {
+              "attention.conv.weight": 0.0011834361357614398
+            },
+            "ll_error": 7.152557373046875e-07,
+            "random_input_hf_energy_ratio": 0.3181115984916687
+          },
+          {
+            "with_gauss": true,
+            "gradient_max": {
+              "attention.conv.weight": 0.0014130508061498404,
+              "gaussian_filter.sigma": 2.222713374067098e-05
+            },
+            "ll_error": 7.152557373046875e-07,
+            "random_input_hf_energy_ratio": 0.31507208943367004
+          }
+        ]
+      }
+    },
+    "sfs": {
+      "status": "PASS",
+      "details": [
+        {
+          "query": [
+            2,
+            256,
+            32,
+            32
+          ],
+          "key": [
+            2,
+            256,
+            16,
+            16
+          ],
+          "contiguous": true,
+          "query_gradient": 1.1906699910468888e-05,
+          "key_gradient": 5.837844582856633e-06,
+          "gradient_max": {
+            "shared_offsets_residual": 0.00032963385456241667,
+            "query_conv.0.weight": 0.0008615849073976278,
+            "query_conv.0.bias": 0.0005200997111387551,
+            "query_conv.1.weight": 0.0003183120861649513,
+            "query_conv.1.bias": 0.0005201023304834962,
+            "key_conv.0.weight": 0.0002486711600795388,
+            "key_conv.0.bias": 0.0003063661279156804,
+            "key_conv.1.weight": 0.0001372536353301257,
+            "key_conv.1.bias": 0.00030636764131486416,
+            "query_norm.weight": 0.00025310844648629427,
+            "query_norm.bias": 0.00023671748931519687,
+            "key_norm.weight": 8.280597830889747e-05,
+            "key_norm.bias": 0.00020717000006698072,
+            "out_norm.weight": 0.00027121370658278465,
+            "out_norm.bias": 0.0002449064631946385,
+            "attention_weights.weight": 0.00021930129150860012,
+            "attention_weights.bias": 0.00012525846250355244,
+            "value_proj.weight": 0.00010843983909580857,
+            "value_proj.bias": 0.0002303563232999295,
+            "output_proj.weight": 0.00011135444219689816,
+            "output_proj.bias": 0.0002173644897993654
+          }
+        },
+        {
+          "query": [
+            2,
+            256,
+            31,
+            29
+          ],
+          "key": [
+            2,
+            256,
+            16,
+            15
+          ],
+          "contiguous": true,
+          "query_gradient": 1.3337486052478198e-05,
+          "key_gradient": 7.202062988653779e-06,
+          "gradient_max": {
+            "shared_offsets_residual": 0.0002752311993390322,
+            "query_conv.0.weight": 0.0009469796204939485,
+            "query_conv.0.bias": 0.0005449499003589153,
+            "query_conv.1.weight": 0.0003551375411916524,
+            "query_conv.1.bias": 0.0005449525779113173,
+            "key_conv.0.weight": 0.0002646430511958897,
+            "key_conv.0.bias": 0.00037188781425356865,
+            "key_conv.1.weight": 0.0001544751285109669,
+            "key_conv.1.bias": 0.00037188970600254834,
+            "query_norm.weight": 0.00028758434928022325,
+            "query_norm.bias": 0.0002540932910051197,
+            "key_norm.weight": 0.00010185519931837916,
+            "key_norm.bias": 0.00019599735969677567,
+            "out_norm.weight": 0.00027292058803141117,
+            "out_norm.bias": 0.00027769344160333276,
+            "attention_weights.weight": 0.00025654342607595026,
+            "attention_weights.bias": 0.00010768369975266978,
+            "value_proj.weight": 0.00011917907249880955,
+            "value_proj.bias": 0.00020138781110290438,
+            "output_proj.weight": 0.0001282399462070316,
+            "output_proj.bias": 0.00026321393670514226
+          }
+        }
+      ]
+    },
+    "original_sfs_equivalence": {
+      "status": "PASS",
+      "details": {
+        "output": 0.0,
+        "query_grad": 0.0,
+        "key_grad": 0.0,
+        "offset_grad": 0.0
+      }
+    },
+    "b0_b4_necks": {
+      "status": "PASS",
+      "details": [
+        {
+          "config": "auxdet_r50_fpn_1x_voc.py",
+          "train_call_order": [
+            "dynamic_atts.0",
+            "edge_convs.0"
+          ],
+          "output_shapes": [
+            [
+              2,
+              256,
+              32,
+              32
+            ],
+            [
+              2,
+              256,
+              16,
+              16
+            ]
+          ],
+          "new_parameter_gradient_max": {},
+          "eval_batch_one": "PASS"
+        },
+        {
+          "config": "auxdet_r50_lfp_p2_1x_voc.py",
+          "train_call_order": [
+            "lfp_modules.0",
+            "dynamic_atts.0",
+            "edge_convs.0"
+          ],
+          "output_shapes": [
+            [
+              2,
+              256,
+              32,
+              32
+            ],
+            [
+              2,
+              256,
+              16,
+              16
+            ]
+          ],
+          "new_parameter_gradient_max": {
+            "lfp_modules.0.attention.conv.weight": 0.004826424643397331,
+            "lfp_modules.0.gaussian_filter.sigma": 0.00047711512888781726
+          },
+          "eval_batch_one": "PASS"
+        },
+        {
+          "config": "auxdet_r50_lfp_p2_after_edge_1x_voc.py",
+          "train_call_order": [
+            "dynamic_atts.0",
+            "edge_convs.0",
+            "lfp_modules.0"
+          ],
+          "output_shapes": [
+            [
+              2,
+              256,
+              32,
+              32
+            ],
+            [
+              2,
+              256,
+              16,
+              16
+            ]
+          ],
+          "new_parameter_gradient_max": {
+            "lfp_modules.0.attention.conv.weight": 0.015679843723773956,
+            "lfp_modules.0.gaussian_filter.sigma": 7.412531704176217e-05
+          },
+          "eval_batch_one": "PASS"
+        },
+        {
+          "config": "auxdet_r50_sfs_p3_p2_1x_voc.py",
+          "train_call_order": [
+            "dynamic_atts.0",
+            "edge_convs.0",
+            "sfs_modules.0"
+          ],
+          "output_shapes": [
+            [
+              2,
+              256,
+              32,
+              32
+            ],
+            [
+              2,
+              256,
+              16,
+              16
+            ]
+          ],
+          "new_parameter_gradient_max": {
+            "sfs_modules.0.shared_offsets_residual": 0.0003731628821697086,
+            "sfs_modules.0.query_conv.0.weight": 0.0012266888516023755,
+            "sfs_modules.0.query_conv.0.bias": 4.8203219193965197e-11,
+            "sfs_modules.0.query_conv.1.weight": 0.00035291339736431837,
+            "sfs_modules.0.query_conv.1.bias": 0.00048270507249981165,
+            "sfs_modules.0.key_conv.0.weight": 0.00040127665852196515,
+            "sfs_modules.0.key_conv.0.bias": 5.9117155615240335e-12,
+            "sfs_modules.0.key_conv.1.weight": 0.0002127469051629305,
+            "sfs_modules.0.key_conv.1.bias": 0.000246763025643304,
+            "sfs_modules.0.query_norm.weight": 0.0002711573906708509,
+            "sfs_modules.0.query_norm.bias": 0.0003308193408884108,
+            "sfs_modules.0.key_norm.weight": 0.00010245089652016759,
+            "sfs_modules.0.key_norm.bias": 0.0003312214103061706,
+            "sfs_modules.0.out_norm.weight": 0.00030267538386397064,
+            "sfs_modules.0.out_norm.bias": 0.00036435984657146037,
+            "sfs_modules.0.attention_weights.weight": 0.0003413764061406255,
+            "sfs_modules.0.attention_weights.bias": 0.0003196190809831023,
+            "sfs_modules.0.value_proj.weight": 0.00015645756502635777,
+            "sfs_modules.0.value_proj.bias": 0.0002687869709916413,
+            "sfs_modules.0.output_proj.weight": 0.00017303533968515694,
+            "sfs_modules.0.output_proj.bias": 0.0003462615131866187
+          },
+          "eval_batch_one": "PASS"
+        },
+        {
+          "config": "auxdet_r50_lfp_after_edge_sfs_p3_p2_1x_voc.py",
+          "train_call_order": [
+            "dynamic_atts.0",
+            "edge_convs.0",
+            "lfp_modules.0",
+            "sfs_modules.0"
+          ],
+          "output_shapes": [
+            [
+              2,
+              256,
+              32,
+              32
+            ],
+            [
+              2,
+              256,
+              16,
+              16
+            ]
+          ],
+          "new_parameter_gradient_max": {
+            "lfp_modules.0.attention.conv.weight": 0.00368896103464067,
+            "lfp_modules.0.gaussian_filter.sigma": 1.735975092742592e-05,
+            "sfs_modules.0.shared_offsets_residual": 0.00030139004229567945,
+            "sfs_modules.0.query_conv.0.weight": 0.0013112188316881657,
+            "sfs_modules.0.query_conv.0.bias": 1.0186340659856796e-10,
+            "sfs_modules.0.query_conv.1.weight": 0.0006911726668477058,
+            "sfs_modules.0.query_conv.1.bias": 0.0004839579632971436,
+            "sfs_modules.0.key_conv.0.weight": 0.00038004133966751397,
+            "sfs_modules.0.key_conv.0.bias": 5.4569682106375694e-12,
+            "sfs_modules.0.key_conv.1.weight": 0.00022089420235715806,
+            "sfs_modules.0.key_conv.1.bias": 0.0002592923119664192,
+            "sfs_modules.0.query_norm.weight": 0.000614162243437022,
+            "sfs_modules.0.query_norm.bias": 0.00036198124871589243,
+            "sfs_modules.0.key_norm.weight": 0.00011842384992633015,
+            "sfs_modules.0.key_norm.bias": 0.000291251577436924,
+            "sfs_modules.0.out_norm.weight": 0.0006139025208540261,
+            "sfs_modules.0.out_norm.bias": 0.00032339378958567977,
+            "sfs_modules.0.attention_weights.weight": 0.00036713198642246425,
+            "sfs_modules.0.attention_weights.bias": 0.0002180624578613788,
+            "sfs_modules.0.value_proj.weight": 0.00016117632912937552,
+            "sfs_modules.0.value_proj.bias": 0.0002502157003618777,
+            "sfs_modules.0.output_proj.weight": 0.00017217066488228738,
+            "sfs_modules.0.output_proj.bias": 0.0005540857673622668
+          },
+          "eval_batch_one": "PASS"
+        }
+      ]
+    }
+  }
+}
