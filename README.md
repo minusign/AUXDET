@@ -167,6 +167,8 @@ Please download it and specify the path to `"best.pth"` in the command above.
 
 可选依赖为 requirements/nsfpn.txt 和 requirements/analysis.txt；实验来源通过 experiment_manifest.example.csv 模板记录。
 
+Meta-LFP 最小版本的结构、配置、参数量、checkpoint 兼容性和运行命令见 [Meta-LFP 说明](/Users/aaash/Documents/2026夏/AUXDET/AUXDET/docs/zh_cn/meta_lfp.md)。
+
 ## 🔖 Citation
 
 ------

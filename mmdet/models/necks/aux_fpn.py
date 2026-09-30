@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 from mmcv.cnn import ConvModule
 from mmengine.model import BaseModule
 from torch import Tensor
@@ -15,6 +15,79 @@ from mmdet.models.utils import DMLPAttention, FCResLayer
 from mmdet.structures import DetDataSample
 from .lfp import LFP
 from .sfs import SpiralAwareCrossDeformAttn2D
+
+
+class ConditionalLFPGate(nn.Module):
+    """Per-sample residual gate for an already computed LFP feature.
+
+    ``aux`` is the layer's auxiliary fused feature: metadata fused with the
+    visual compensation feature produced by M2DM.
+    """
+
+    def __init__(self, visual_channels: int, aux_channels: int,
+                 hidden_dim: int = 64, mode: str = 'visual',
+                 gate_init: float = 0.1) -> None:
+        super().__init__()
+        if mode not in ('visual', 'visual_aux'):
+            raise ValueError("Meta-LFP gate mode must be 'visual' or 'visual_aux'")
+        if not 0 < gate_init < 1:
+            raise ValueError('gate_init must satisfy 0 < gate_init < 1')
+        if hidden_dim <= 0:
+            raise ValueError('gate_hidden_dim must be positive')
+        self.visual_channels = visual_channels
+        self.aux_channels = aux_channels
+        self.hidden_dim = hidden_dim
+        self.mode = mode
+        self.gate_init = float(gate_init)
+        self.mlp = nn.Sequential(
+            nn.Linear(visual_channels + aux_channels, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self._last_gate_stats = None
+        self.init_weights()
+
+    def init_weights(self) -> None:
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.constant_(self.mlp[-1].bias,
+                          torch.logit(torch.tensor(self.gate_init)).item())
+
+    @staticmethod
+    def blend(feature: Tensor, lfp_feature: Tensor, gate: Tensor) -> Tensor:
+        """Blend F and LFP(F), preserving the input shape and dtype."""
+        if gate.ndim != 4 or gate.shape[1:] != (1, 1, 1):
+            raise ValueError(f'gate must have shape [B,1,1,1], got {tuple(gate.shape)}')
+        blended = feature + gate * (lfp_feature - feature)
+        # Keep the two mathematical endpoints exact for diagnostics and for
+        # callers that deliberately clamp a gate to 0 or 1.
+        return torch.where(gate == 0, feature,
+                           torch.where(gate == 1, lfp_feature, blended))
+
+    def forward(self, feature: Tensor, lfp_feature: Tensor,
+                aux: Optional[Tensor] = None) -> Tensor:
+        if feature.shape != lfp_feature.shape:
+            raise ValueError('feature and lfp_feature must have identical shapes')
+        if feature.ndim != 4 or feature.shape[1] != self.visual_channels:
+            raise ValueError('Meta-LFP gate received an invalid visual feature shape')
+        if aux is None:
+            raise ValueError('Meta-LFP gate requires the matching layer auxiliary feature')
+        if aux.ndim != 2 or aux.shape[0] != feature.shape[0] or aux.shape[1] != self.aux_channels:
+            raise ValueError('Meta-LFP gate received an invalid auxiliary feature shape')
+        visual = feature.mean(dim=(2, 3))
+        condition_aux = torch.zeros_like(aux) if self.mode == 'visual' else aux
+        condition = torch.cat((visual, condition_aux), dim=1)
+        gate = torch.sigmoid(self.mlp(condition)).view(-1, 1, 1, 1)
+        detached = gate.detach().float()
+        self._last_gate_stats = {
+            'mean': float(detached.mean()),
+            'std': float(detached.std(unbiased=False)),
+            'min': float(detached.min()),
+            'max': float(detached.max()),
+        }
+        return self.blend(feature, lfp_feature, gate)
+
+    def get_gate_stats(self):
+        return None if self._last_gate_stats is None else dict(self._last_gate_stats)
 
 
 @MODELS.register_module()
@@ -94,6 +167,7 @@ class AuxFPN(BaseModule):
             lfp_position: str = 'before_modulation',
             sfs_cfg: OptConfigType = None,
             sfs_fusions: Tuple[int, ...] = (),
+            lfp_gate_cfg: OptConfigType = None,
     ) -> None:
         super().__init__(init_cfg=init_cfg)
         assert isinstance(in_channels, list)
@@ -118,6 +192,7 @@ class AuxFPN(BaseModule):
                 f'lfp_levels must be within [0, {self.num_ins}), '
                 f'got {self.lfp_levels}')
         self.lfp_modules = nn.ModuleDict()
+        self.lfp_gates = nn.ModuleDict()
         self.sfs_fusions = tuple(sfs_fusions)
         if bool(self.sfs_fusions) != (sfs_cfg is not None):
             raise ValueError('sfs_cfg and non-empty sfs_fusions must be provided together')
@@ -127,6 +202,23 @@ class AuxFPN(BaseModule):
                 f'sfs_fusions must be within [0, {self.num_ins - 1}), '
                 f'got {self.sfs_fusions}')
         self.sfs_modules = nn.ModuleDict()
+        if lfp_gate_cfg is not None:
+            if lfp_position != 'after_edge':
+                raise ValueError("Meta-LFP gate currently supports only lfp_position='after_edge'")
+            gate_cfg = dict(lfp_gate_cfg)
+            gate_level = int(gate_cfg.pop('level', 0))
+            if gate_level != 0:
+                raise ValueError('Meta-LFP gate currently supports only the P2 lateral level=0')
+            if gate_level not in self.lfp_levels:
+                raise ValueError('Meta-LFP gate level must be enabled in lfp_levels')
+            gate_cfg.setdefault('visual_channels', out_channels)
+            # MetaFeatureProcessorWithSem is constructed with
+            # channel_outs=out_channels//2; its final all_aux_fea therefore
+            # has out_channels//2 channels (128 for the current R50 configs).
+            gate_cfg.setdefault('aux_channels', out_channels // 2)
+            self._lfp_gate_levels = (gate_level,)
+        else:
+            self._lfp_gate_levels = ()
 
         if end_level == -1 or end_level == self.num_ins - 1:
             self.backbone_end_level = self.num_ins
@@ -227,6 +319,8 @@ class AuxFPN(BaseModule):
                 cfg = dict(lfp_cfg)
                 cfg.setdefault('in_channels', out_channels)
                 self.lfp_modules[str(level)] = LFP(**cfg)
+        if lfp_gate_cfg is not None:
+            self.lfp_gates[str(self._lfp_gate_levels[0])] = ConditionalLFPGate(**gate_cfg)
         if sfs_cfg is not None and self.sfs_fusions:
             for level in self.sfs_fusions:
                 cfg = dict(sfs_cfg)
@@ -260,6 +354,7 @@ class AuxFPN(BaseModule):
                     laterals[level] = self.lfp_modules[level_key](laterals[level])
 
         alphas = []
+        aux_features = {}
         for idx in range(2):
             # step 1. 获取补偿特征并降维
             sem_comp_fea = self.downsamples[idx](laterals[idx]) - laterals[-1]
@@ -267,6 +362,10 @@ class AuxFPN(BaseModule):
             # step 2. 融合 元数据特征及补偿特征，得到最终辅助特征
             all_aux_fea = self.meta_process_with_sem(
                 meta_inf, inputs[0].dtype, inputs[0].device, sem_inf)
+            # Keep the per-level auxiliary fused feature for optional gates.
+            # It already contains the M2DM visual compensation; do not encode
+            # metadata a second time for Meta-LFP.
+            aux_features[idx] = all_aux_fea
 
             # 为当前层计算 ALPHA 并保存，用于自适应调整后续边缘特征增强
             current_alpha = self.mlp(all_aux_fea).view(-1, 1, 1, 1)
@@ -300,7 +399,16 @@ class AuxFPN(BaseModule):
             for level in self.lfp_levels:
                 level_key = str(level)
                 if level_key in self.lfp_modules:
-                    laterals[level] = self.lfp_modules[level_key](laterals[level])
+                    feature = laterals[level]
+                    lfp_feature = self.lfp_modules[level_key](feature)
+                    if level_key in self.lfp_gates:
+                        if level not in aux_features:
+                            raise RuntimeError(
+                                f'Meta-LFP gate has no auxiliary feature for level {level}')
+                        laterals[level] = self.lfp_gates[level_key](
+                            feature, lfp_feature, aux_features[level])
+                    else:
+                        laterals[level] = lfp_feature
 
         # build top-down path
         used_backbone_levels = len(laterals)
@@ -350,6 +458,12 @@ class AuxFPN(BaseModule):
 
         # return tuple(outs)
         return tuple(outs[:2])
+
+    def get_lfp_gate_stats(self):
+        """Return detached per-level gate statistics from the latest forward."""
+        return {level: module.get_gate_stats()
+                for level, module in self.lfp_gates.items()
+                if module.get_gate_stats() is not None}
 
 
 class MetaFeatureProcessorWithSem(nn.Module):
