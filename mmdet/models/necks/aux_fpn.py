@@ -193,90 +193,51 @@ class AuxFPN(BaseModule):
             nn.Sigmoid()  # 限制权重范围在 (0,1)
         )
 
-    def forward(self, inputs: Tuple[Tensor], meta_inf: List[DetDataSample]) -> Tuple[Tensor]:
-        """Forward function.
-
-        Args:
-            inputs (tuple[Tensor]): Features from the upstream network, each is a 4D-tensor.
-                Shape: (Batch_size, Channels, H, W).
-            meta_inf (List[DataSample]): Batch data samples containing meta information of images.
-
-        Returns:
-            tuple[Tensor]: Output feature maps, each is a 4D-tensor.
-                Shape: (Batch_size, Out_channels, H', W').
-        """
+    def _prepare_aux_laterals(self, inputs: Tuple[Tensor], meta_inf: List[DetDataSample]):
+        """Run the original AuxDet projection and metadata path unchanged."""
         assert len(inputs) == len(self.in_channels)
-
-        # build laterals
         laterals = [
             lateral_conv(inputs[i + self.start_level])
             for i, lateral_conv in enumerate(self.lateral_convs)
         ]
-
         alphas = []
         for idx in range(2):
-            # step 1. 获取补偿特征并降维
             sem_comp_fea = self.downsamples[idx](laterals[idx]) - laterals[-1]
             sem_inf = self.sem_gap(sem_comp_fea).flatten(1)
-            # step 2. 融合 元数据特征及补偿特征，得到最终辅助特征
             all_aux_fea = self.meta_process_with_sem(
                 meta_inf, inputs[0].dtype, inputs[0].device, sem_inf)
-
-            # 为当前层计算 ALPHA 并保存，用于自适应调整后续边缘特征增强
             current_alpha = self.mlp(all_aux_fea).view(-1, 1, 1, 1)
-            alphas.append(current_alpha)  # 保存到列表
-
-            # 注：通道-空间 调制 并行展开
+            alphas.append(current_alpha)
             B, C, _, _ = laterals[idx].shape
-            # step 3. 动态融合 最终辅助特征与当前层的图像特征，得到调制参数
             modulation_weights = self.dynamic_atts[idx](laterals[idx], all_aux_fea)
-            # step 4. 分解得到 通道调制参数 和 空间调制参数
-            channel_modulation_weights, spatial_modulation_weights = modulation_weights[:, :C].sigmoid(), modulation_weights[:, C:].sigmoid()
-
-            # step 5. 分别进行 逐样本得 通道调制 和 空间调制
+            channel_modulation_weights = modulation_weights[:, :C].sigmoid()
+            spatial_modulation_weights = modulation_weights[:, C:].sigmoid()
             c = laterals[idx] * channel_modulation_weights.reshape(B, C, 1, 1) + laterals[idx]
             s = self.sm(laterals[idx], spatial_modulation_weights)
-
-            # step 6. 融合调制后的特征
             laterals[idx] = laterals[idx] + s + c
-
-        # 进行边缘增强
-        edge_features = [
-            edge_conv(laterals[i])
-            for i, edge_conv in enumerate(self.edge_convs)
-        ]
-
-        # 边缘增强后 与原特征 融合
-        for i in range(len(edge_features)):  # 只遍历前两个
+        edge_features = [edge_conv(laterals[i]) for i, edge_conv in enumerate(self.edge_convs)]
+        for i in range(len(edge_features)):
             laterals[i] = laterals[i] + alphas[i] * edge_features[i]
+        return laterals
 
-        # build top-down path
+    def _build_aux_outputs(self, inputs, laterals, use_top_down=True):
+        """Build output convolutions, retaining the baseline two-level contract."""
         used_backbone_levels = len(laterals)
-        for i in range(used_backbone_levels - 1, 0, -1):
-            # In some cases, fixing `scale factor` (e.g. 2) is preferred, but
-            #  it cannot co-exist with `size` in `F.interpolate`.
-            if 'scale_factor' in self.upsample_cfg:
-                # fix runtime error of "+=" inplace operation in PyTorch 1.10
-                laterals[i - 1] = laterals[i - 1] + F.interpolate(
-                    laterals[i], **self.upsample_cfg)
-            else:
-                prev_shape = laterals[i - 1].shape[2:]
-                laterals[i - 1] = laterals[i - 1] + F.interpolate(
-                    laterals[i], size=prev_shape, **self.upsample_cfg)
-
-        outs = [
-            self.fpn_convs[i](laterals[i]) for i in range(used_backbone_levels)
-        # self.fpn_convs[i](laterals[i]) for i in range(self.num_outs)
-        ]
-
-        # part 2: add extra levels
+        if use_top_down:
+            for i in range(used_backbone_levels - 1, 0, -1):
+                if 'scale_factor' in self.upsample_cfg:
+                    laterals[i - 1] = laterals[i - 1] + F.interpolate(
+                        laterals[i], **self.upsample_cfg)
+                else:
+                    prev_shape = laterals[i - 1].shape[2:]
+                    laterals[i - 1] = laterals[i - 1] + F.interpolate(
+                        laterals[i], size=prev_shape, **self.upsample_cfg)
+        outs = [self.fpn_convs[i](laterals[i])
+                for i in range(used_backbone_levels)]
         if self.num_outs > len(outs):
-            # use max pool to get more levels on top of outputs
-            # (e.g., Faster R-CNN, Mask R-CNN)
             if not self.add_extra_convs:
-                for i in range(self.num_outs - used_backbone_levels):
+                for _ in range(self.num_outs - used_backbone_levels):
                     outs.append(F.max_pool2d(outs[-1], 1, stride=2))
-            # add conv layers on top of original feature maps (RetinaNet)
             else:
                 if self.add_extra_convs == 'on_input':
                     extra_source = inputs[self.backbone_end_level - 1]
@@ -288,13 +249,13 @@ class AuxFPN(BaseModule):
                     raise NotImplementedError
                 outs.append(self.fpn_convs[used_backbone_levels](extra_source))
                 for i in range(used_backbone_levels + 1, self.num_outs):
-                    if self.relu_before_extra_convs:
-                        outs.append(self.fpn_convs[i](F.relu(outs[-1])))
-                    else:
-                        outs.append(self.fpn_convs[i](outs[-1]))
-
-        # return tuple(outs)
+                    source = F.relu(outs[-1]) if self.relu_before_extra_convs else outs[-1]
+                    outs.append(self.fpn_convs[i](source))
         return tuple(outs[:2])
+
+    def forward(self, inputs: Tuple[Tensor], meta_inf: List[DetDataSample]) -> Tuple[Tensor]:
+        laterals = self._prepare_aux_laterals(inputs, meta_inf)
+        return self._build_aux_outputs(inputs, laterals, use_top_down=True)
 
 
 class MetaFeatureProcessorWithSem(nn.Module):
