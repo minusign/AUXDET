@@ -13,7 +13,7 @@
 | AuxDet + PConv + HS-FPN | `configs/graduation/auxdet_pconv_hsfpn.py` |
 | AuxDet + PConv + NS-FPN | `configs/graduation/auxdet_pconv_nsfpn.py` |
 
-所有配置继续使用 `tools/train.py` 和 `tools/test.py`。数据、元数据、检测头、损失、优化器、12 epoch 调度器和 VOC 评估均继承真实 AuxDet 基线。HS 与 NS 通过 `model.neck.fusion_type` 互斥。
+所有配置继续使用 `tools/train.py` 和 `tools/test.py`。数据、元数据、检测头、损失、SGD 类型及 momentum/weight_decay、12 epoch 调度器和 VOC 评估均继承真实 AuxDet 基线。毕业设计公共配置显式设置 `lr=0.005`、`auto_scale_lr.enable=False`，原始 schedule 保持不变。HS 与 NS 通过 `model.neck.fusion_type` 互斥。
 
 ## 数据流和实现边界
 
@@ -49,10 +49,14 @@ NS 算子来源包含 Deformable DETR 的 Apache 2.0 文件头；NS-FPN 根目�
 六个配置使用：
 
 ```bash
-export AUXDET_DATA_ROOT=/srv/data/WideIRSTD-AuxDet
+source /root/anaconda3/etc/profile.d/conda.sh
+conda activate auxdet
+cd /root/projects/AUXDET
+export AUXDET_DATA_ROOT=/root/projects/AUXDET/data
+export AUXDET_RUN_ROOT=/root/projects/AUXDET/work_dirs/graduation
 ```
 
-未设置时使用项目相对的 `AUXDET/data_root`。公共配置同时覆盖 train/val/test dataset 的 `data_root`，保留 `VOC2007/ImageSets/Main/{train,val}.txt`、`PNGImages` 和 `Annotations` 结构。
+环境变量未设置或为空时，通过 MMEngine 预定义变量 `{{fileDirname}}` 计算仓库根目录下的 `data_root` 绝对路径，不依赖命令工作目录。设置非空环境变量时使用用户给定值。配置解析不要求完整数据集存在。公共配置同时覆盖 train/val/test dataset 的 `data_root`，保留 `VOC2007/ImageSets/Main/{train,val}.txt`、`PNGImages` 和 `Annotations` 结构。
 
 运行元数据检查：
 
@@ -80,7 +84,7 @@ python tools/analysis_tools/check_auxdet_integration.py --build
 AuxDet/PConv/HS 不需要导入 NS 的 CUDA 扩展。HS 服务器环境需要与当前 MMDetection/MMEngine 兼容的 `torch-dct` 和 `einops`。NS 还需要 `pytorch-wavelets==1.3.0`，并在服务器按实际 PyTorch/CUDA 编译：
 
 ```bash
-cd /srv/AUXDET/mmdet/models/necks/sfs_ms_deform_attn
+cd /root/projects/AUXDET/mmdet/models/necks/sfs_ms_deform_attn
 python setup.py build_ext --inplace
 ```
 
@@ -88,26 +92,36 @@ python setup.py build_ext --inplace
 
 ## 运行命令
 
-配置解析和模型构建先使用服务器兼容环境执行：
+先完成下文“公共配置修复验证”中的六组配置解析检查，再按依赖条件运行现有检查脚本的 `--build` 模型构建检查，最后才执行以下真实训练命令。配置解析、模型构建和真实训练验证是三个不同阶段。训练前激活环境并明确设置路径：
 
 ```bash
-python tools/train.py configs/graduation/auxdet_base.py --work-dir work_dirs/e0 \
-  --cfg-options train_dataloader.batch_size=4 randomness.seed=0
-python tools/train.py configs/graduation/auxdet_pconv.py --work-dir work_dirs/e1 \
-  --cfg-options train_dataloader.batch_size=4 randomness.seed=0
-python tools/train.py configs/graduation/auxdet_hsfpn.py --work-dir work_dirs/hs \
-  --cfg-options train_dataloader.batch_size=4 randomness.seed=0
-python tools/train.py configs/graduation/auxdet_nsfpn.py --work-dir work_dirs/ns \
-  --cfg-options train_dataloader.batch_size=4 randomness.seed=0
+source /root/anaconda3/etc/profile.d/conda.sh
+conda activate auxdet
+cd /root/projects/AUXDET
+export AUXDET_DATA_ROOT=/root/projects/AUXDET/data
+export AUXDET_RUN_ROOT=/root/projects/AUXDET/work_dirs/graduation
+```
+
+`AUXDET_RUN_ROOT` 由 shell 展开并通过 `--work-dir` 传入，不会自动由公共配置读取。原始单卡 batch=4 的缩放结果为 `0.02 × 4 / 16 = 0.005`；毕业实验现在固定该默认值，改变 batch size 不会自动调整 LR。
+
+```bash
+python tools/train.py configs/graduation/auxdet_base.py --work-dir "$AUXDET_RUN_ROOT/e0" \
+  --cfg-options train_dataloader.batch_size=4 optim_wrapper.optimizer.lr=0.005 auto_scale_lr.enable=False randomness.seed=0
+python tools/train.py configs/graduation/auxdet_pconv.py --work-dir "$AUXDET_RUN_ROOT/e1" \
+  --cfg-options train_dataloader.batch_size=4 optim_wrapper.optimizer.lr=0.005 auto_scale_lr.enable=False randomness.seed=0
+python tools/train.py configs/graduation/auxdet_hsfpn.py --work-dir "$AUXDET_RUN_ROOT/hs" \
+  --cfg-options train_dataloader.batch_size=4 optim_wrapper.optimizer.lr=0.005 auto_scale_lr.enable=False randomness.seed=0
+python tools/train.py configs/graduation/auxdet_nsfpn.py --work-dir "$AUXDET_RUN_ROOT/ns" \
+  --cfg-options train_dataloader.batch_size=4 optim_wrapper.optimizer.lr=0.005 auto_scale_lr.enable=False randomness.seed=0
 ```
 
 组合配置分别使用 `auxdet_pconv_hsfpn.py` 和 `auxdet_pconv_nsfpn.py`，每个实验使用独立 work directory。学习率、batch size、轮数、数据根目录示例：
 
 ```bash
 python tools/train.py configs/graduation/auxdet_pconv_hsfpn.py \
-  --work-dir work_dirs/pconv_hs \
+  --work-dir "$AUXDET_RUN_ROOT/pconv_hs" \
   --cfg-options \
-    optim_wrapper.optimizer.lr=0.01 \
+    optim_wrapper.optimizer.lr=0.01 auto_scale_lr.enable=False \
     train_dataloader.batch_size=2 \
     train_cfg.max_epochs=24 \
     param_scheduler.1.end=24 \
@@ -119,16 +133,16 @@ python tools/train.py configs/graduation/auxdet_pconv_hsfpn.py \
 
 ```bash
 python tools/train.py configs/graduation/auxdet_base.py \
-  --work-dir work_dirs/e0 --resume auto
+  --work-dir "$AUXDET_RUN_ROOT/e0" --resume auto
 python tools/train.py configs/graduation/auxdet_base.py \
-  --work-dir work_dirs/e0 --resume work_dirs/e0/epoch_12.pth
+  --work-dir "$AUXDET_RUN_ROOT/e0" --resume "$AUXDET_RUN_ROOT/e0/epoch_12.pth"
 ```
 
 验证：
 
 ```bash
-python tools/test.py configs/graduation/auxdet_base.py work_dirs/e0/best_pascal_voc_AP50.pth \
-  --work-dir work_dirs/e0/eval
+python tools/test.py configs/graduation/auxdet_base.py "$AUXDET_RUN_ROOT/e0/best_pascal_voc_AP50.pth" \
+  --work-dir "$AUXDET_RUN_ROOT/e0/eval"
 ```
 
 实际 checkpoint 文件名以服务器 CheckpointHook 输出为准，不要预先假定一定叫 `best.pth`。每次服务器实验应记录 commit、最终解析配置、seed、完整命令、work_dir 和实际 checkpoint 路径；运行期间不要更新正在使用的源码目录。
@@ -143,7 +157,7 @@ python tools/test.py configs/graduation/auxdet_base.py work_dirs/e0/best_pascal_
 - HS 的 DCT/HFP/SDP 融合主体。
 - NS 的 DWT/LFP/SFS 融合主体及源码构建目录。
 - 六份配置、数据根目录覆盖、XML 元数据检查脚本和本说明。
-- 六份配置的独立解析/registry 检查脚本。
+- 六份配置的解析/registry 检查脚本（同一进程顺序检查）。
 
 ### 本地已验证
 
@@ -163,7 +177,81 @@ python tools/test.py configs/graduation/auxdet_base.py work_dirs/e0/best_pascal_
 
 ### 真实阻塞项
 
-- 服务器 Python/PyTorch/CUDA/MMCV/MMEngine/编译器版本尚未提供。
+- 服务器已知 Python 3.9、MMEngine 0.10.7，解释器 `/root/anaconda3/envs/auxdet/bin/python`；PyTorch/CUDA/MMCV/编译器版本仍待确认。
 - `torch-dct`、`pytorch-wavelets` 和 `einops` 的兼容版本需要服务器确认。
 - NS-FPN 根目录许可证未找到，SFS 迁入发布前仍需核实。
 - 本地无法运行 PyTorch/MMCV 相关检查；NS CUDA 编译和 GPU 运行必须由服务器完成。
+
+## 公共配置修复验证（2026-10-17）
+
+本次仅修改 `configs/graduation/auxdet_base.py` 和本说明，保留 `configs/_base_/datasets/voc_aux.py` 已有用户修改。公共配置使用 `{{fileDirname}}` 替代配置上下文中未定义的 `__file__`；环境变量缺失或为空时回退到仓库根目录/data_root；三个 dataset 根目录覆盖保持不变。只覆盖 `optim_wrapper.optimizer.lr=0.005` 和 `auto_scale_lr.enable=False`，继承 SGD、momentum、weight_decay、base_batch_size、预热、调度器和默认轮数，不使用 `_delete_`。
+
+本地状态：**BLOCKED：未执行 Config.fromfile 验证。** 本地解释器缺少 MMEngine。语法检查不代表配置解析通过。以下服务器命令尚未在本次修复中执行，不需要 GPU、模型构建或完整数据集。
+
+先激活环境、设置数据和输出根目录，再优先复用现有检查：
+
+```bash
+source /root/anaconda3/etc/profile.d/conda.sh
+conda activate auxdet
+cd /root/projects/AUXDET
+export AUXDET_DATA_ROOT=/root/projects/AUXDET/data
+export AUXDET_RUN_ROOT=/root/projects/AUXDET/work_dirs/graduation
+python -c "import sys, mmengine; print(sys.executable); print(mmengine.__version__)"
+python tools/analysis_tools/check_auxdet_integration.py
+```
+
+补充检查四种路径场景和 CLI 等效覆盖，每组配置在独立子进程中使用真正的 `Config.fromfile`，失败时保留 traceback 并返回非零：
+
+```bash
+/root/anaconda3/envs/auxdet/bin/python -B - <<'PY'
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+repo = Path('/root/projects/AUXDET')
+names = ('auxdet_base', 'auxdet_pconv', 'auxdet_hsfpn',
+         'auxdet_nsfpn', 'auxdet_pconv_hsfpn', 'auxdet_pconv_nsfpn')
+child = r"""
+import sys
+from mmengine.config import Config
+path, expected = sys.argv[1:]
+cfg = Config.fromfile(path)
+for split in ('train', 'val', 'test'):
+    actual = cfg[split + '_dataloader'].dataset.data_root
+    assert actual == expected, (split, actual, expected)
+assert cfg.optim_wrapper.optimizer.lr == 0.005
+assert cfg.auto_scale_lr.enable is False
+assert cfg.auto_scale_lr.base_batch_size == 16
+assert cfg.optim_wrapper.optimizer.type == 'SGD'
+assert cfg.optim_wrapper.optimizer.momentum == 0.9
+assert cfg.optim_wrapper.optimizer.weight_decay == 0.0001
+cfg.merge_from_dict({'optim_wrapper.optimizer.lr': 0.001,
+                     'train_dataloader.batch_size': 2,
+                     'auto_scale_lr.enable': False})
+assert cfg.optim_wrapper.optimizer.lr == 0.001
+assert cfg.train_dataloader.batch_size == 2
+assert cfg.auto_scale_lr.enable is False
+print('CONFIG_PARSE_AND_OVERRIDE_OK', path, expected)
+"""
+for label, value, cwd in (
+    ('unset', None, repo),
+    ('empty', '', repo),
+    ('explicit', '/root/projects/AUXDET/data', repo),
+    ('other_cwd', None, Path('/tmp')),
+):
+    env = os.environ.copy()
+    env.pop('AUXDET_DATA_ROOT', None)
+    if value is not None:
+        env['AUXDET_DATA_ROOT'] = value
+    expected = value or str(repo / 'data_root')
+    for name in names:
+        print('CHECK', label, name, flush=True)
+        subprocess.run([sys.executable, '-B', '-c', child,
+                        str(repo / 'configs/graduation' / (name + '.py')),
+                        expected], cwd=str(cwd), env=env, check=True)
+print('ALL_24_CONFIG_CASES_PASSED')
+PY
+```
+
+以上成功只表示真实配置解析、路径和覆盖检查成功；`--build` 才执行模型构建，真实数据上的 loss、反向、checkpoint 和评估需要另行验证。本次没有执行模型构建或训练。

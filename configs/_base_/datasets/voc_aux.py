@@ -1,6 +1,6 @@
 # dataset settings
 dataset_type = "VSBWILDVOCDetDataset"
-data_root = "/home/ices/cjh/AuxDet/data_root/"
+data_root = "/root/projects/AUXDET/data/"
 
 METAINFO = {
     "classes": ("Target",),
