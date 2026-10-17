@@ -167,7 +167,7 @@ NS-FPN 的 LFP 实际是 Haar DWT → LL 引导高频空间注意力 → 可学�
 
 修改 `train_cfg.max_epochs` 时必须同步 `param_scheduler` 中 MultiStepLR 的 `end` 和 `milestones`（`schedule_1x.py:7-17`）；否则调度器仍按 12 epoch 的边界工作。warmup `end=500` 是否需调整取决于 batch/数据量，尚未运行验证。
 
-图像/标注/元数据路径最终链路为 `data_root`（`configs/_base_/datasets/voc_aux.py:2`）+ dataset `data_prefix.sub_data_root='VOC2007/'` + `img_subdir='PNGImages'`/`ann_subdir='Annotations'` + `ann_file='VOC2007/ImageSets/Main/{train,val}.txt'`（`:50-87`）；XML 的 `<size>`, `<view>`, `<band_type>` 进入 sample。当前配置硬编码 `/home/ices/cjh/AuxDet/data_root/`，服务器路径未知，必须 CLI 覆盖或新配置继承覆盖。
+图像/标注/元数据路径最终链路为 `data_root`（`configs/_base_/datasets/voc_aux.py:2`）+ dataset `data_prefix.sub_data_root='VOC2007/'` + `img_subdir='PNGImages'`/`ann_subdir='Annotations'` + `ann_file='VOC2007/ImageSets/Main/{train,val}.txt'`（`:50-87`）；XML 的 `<size>`, `<view>`, `<band_type>` 进入 sample。审计时配置曾使用旧机器绝对路径；2026-10-17 路径更新：AuxDet 数据配置统一为 `/root/projects/AUXDET/data_root/`，毕业配置默认计算仓库根目录下的 `data_root`，服务器运行时显式指定 `AUXDET_DATA_ROOT=/root/projects/AUXDET/data_root`。
 
 训练输出默认 `./work_dirs/<config basename>`，可由 `--work-dir` 覆盖（`train.py:73-79`）；CheckpointHook 每 epoch 保存（`default_runtime.py:3-10`），最优权重只有在配置额外设置 `save_best` 等策略时才会生成，当前默认配置未确认有 `save_best`；README 所称 `best.pth` 不是由当前文件直接保证。恢复训练由 `--resume` 或配置 `resume`/`load_from` 控制，评估使用 `tools/test.py config checkpoint`。
 

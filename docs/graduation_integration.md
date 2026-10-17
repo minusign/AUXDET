@@ -15,6 +15,54 @@
 
 所有配置继续使用 `tools/train.py` 和 `tools/test.py`。数据、元数据、检测头、损失、SGD 类型及 momentum/weight_decay、12 epoch 调度器和 VOC 评估均继承真实 AuxDet 基线。毕业设计公共配置显式设置 `lr=0.005`、`auto_scale_lr.enable=False`，原始 schedule 保持不变。HS 与 NS 通过 `model.neck.fusion_type` 互斥。
 
+## 服务器 E0 依赖修复与运行顺序（2026-10-17）
+
+最新日志确认配置已经解析，`optimizer.lr=0.005` 和 `auto_scale_lr.enable=False` 正确；模型构建在 AuxFPN 顶层导入 `einops` 时失败。修改前公共 requirements 未声明该包，服务器也未安装，因此依赖声明和环境安装两处均有缺口。本次统一实际数据根目录为 `/root/projects/AUXDET/data_root`；`work_dir=/e0_base_seed42` 与空的输出根目录变量展开一致。以下命令明确固定两个路径。
+
+**Git 同步只同步仓库文件，不会自动安装服务器 Conda 环境中的包。即使 requirements 已更新，服务器也必须执行安装命令。** 本次只补充 einops，不升级 PyTorch、TorchVision、MMCV、MMEngine 或系统 CUDA，也不安装 HS/NS 参考仓库的整套旧环境。
+
+依次执行，前一步出现错误时先处理错误，不把导入成功当成训练通过：
+
+```bash
+# 1. 激活现有环境，进入已同步修复的仓库
+source /root/anaconda3/etc/profile.d/conda.sh
+conda activate auxdet
+cd /root/projects/AUXDET
+
+# 2. 本次最小补装；--no-deps 避免调整现有训练框架依赖
+python -m pip install --no-deps 'einops==0.6.1'
+
+# 3. 记录解释器与包版本，真实导入 AuxFPN
+python -B - <<'PY'
+import sys
+import einops
+from mmdet.models.necks.aux_fpn import AuxFPN
+print('Python:', sys.executable)
+print('einops:', einops.__version__)
+print('AuxFPN import OK:', AuxFPN.__module__)
+PY
+
+# 4. 使用实际数据目录，查看 train/val 元数据缺失和非法项统计
+python tools/analysis_tools/check_auxdet_data.py /root/projects/AUXDET/data_root
+
+# 配置解析检查不构建模型、不运行训练；不需要预先安装 NS 算子
+AUXDET_DATA_ROOT=/root/projects/AUXDET/data_root python tools/analysis_tools/check_auxdet_integration.py
+
+# 5. 确认导入与数据检查无阻塞后，开始 E0 真实训练
+AUXDET_DATA_ROOT=/root/projects/AUXDET/data_root CUDA_VISIBLE_DEVICES=0 python tools/train.py \
+  configs/graduation/auxdet_base.py \
+  --work-dir /root/projects/AUXDET/work_dirs/graduation/e0_base_seed42 \
+  --cfg-options \
+    randomness.seed=42 \
+    train_dataloader.batch_size=4 \
+    optim_wrapper.optimizer.lr=0.005 \
+    auto_scale_lr.enable=False
+```
+
+数据检查脚本打印统计结果，不代表它会自动在所有问题上以非零退出；需要确认样本数、XML 和元数据缺失/非法计数。HS 专用 `torch-dct`、NS 专用 `pytorch-wavelets` 和 SFS 源码编译不属于此次 E0 补装步骤。SFS 必须另行核对编译工具链与 PyTorch CUDA 版本，不能因 E0 导入成功声称已编译或可用。
+
+本次本地状态：**BLOCKED：未完成 AuxFPN 实际导入验证。** 本机缺少 einops 和完整 PyTorch/MMCV 运行环境，未安装依赖，也未在服务器执行以上命令。配置解析、模块导入、模型构建和真实训练是不同验证阶段，当前日志不能证明训练通过。
+
 ## 数据流和实现边界
 
 `TwoStageDetector.extract_feat` 仍调用 `neck(backbone_outputs, batch_data_samples)`。`AuxFPN` 新增 `_prepare_aux_laterals`，保留原横向投影、两层语义补偿、元数据 MLP、动态通道/空间调制和 `EdgeConvSep` 的模块属性及计算顺序；原 `AuxFPN.forward` 只是在该方法之后执行原 top-down 和输出卷积。
@@ -46,14 +94,12 @@ NS 算子来源包含 Deformable DETR 的 Apache 2.0 文件头；NS-FPN 根目�
 
 ## 数据根目录、检查和评估
 
-六个配置使用：
+六个配置使用相同环境，先激活并进入仓库：
 
 ```bash
 source /root/anaconda3/etc/profile.d/conda.sh
 conda activate auxdet
 cd /root/projects/AUXDET
-export AUXDET_DATA_ROOT=/root/projects/AUXDET/data
-export AUXDET_RUN_ROOT=/root/projects/AUXDET/work_dirs/graduation
 ```
 
 环境变量未设置或为空时，通过 MMEngine 预定义变量 `{{fileDirname}}` 计算仓库根目录下的 `data_root` 绝对路径，不依赖命令工作目录。设置非空环境变量时使用用户给定值。配置解析不要求完整数据集存在。公共配置同时覆盖 train/val/test dataset 的 `data_root`，保留 `VOC2007/ImageSets/Main/{train,val}.txt`、`PNGImages` 和 `Annotations` 结构。
@@ -61,7 +107,7 @@ export AUXDET_RUN_ROOT=/root/projects/AUXDET/work_dirs/graduation
 运行元数据检查：
 
 ```bash
-python tools/analysis_tools/check_auxdet_data.py "$AUXDET_DATA_ROOT"
+python tools/analysis_tools/check_auxdet_data.py /root/projects/AUXDET/data_root
 ```
 
 该检查统计 XML 缺失、尺寸非法、`view` 缺失/非法、`band_type` 缺失/非法；不会生成虚构元数据。
@@ -69,8 +115,8 @@ python tools/analysis_tools/check_auxdet_data.py "$AUXDET_DATA_ROOT"
 配置解析和模型 registry 检查：
 
 ```bash
-python tools/analysis_tools/check_auxdet_integration.py
-python tools/analysis_tools/check_auxdet_integration.py --build
+AUXDET_DATA_ROOT=/root/projects/AUXDET/data_root python tools/analysis_tools/check_auxdet_integration.py
+AUXDET_DATA_ROOT=/root/projects/AUXDET/data_root python tools/analysis_tools/check_auxdet_integration.py --build
 ```
 
 不带 `--build` 只检查六份配置解析；带 `--build` 才构建六个 detector。脚本会把缺少框架、配置解析失败和模型构建失败分别报告，不会把未执行的 tensor、loss 或真实数据检查标成成功。
@@ -81,7 +127,7 @@ python tools/analysis_tools/check_auxdet_integration.py --build
 
 ## 依赖和 SFS 构建
 
-AuxDet/PConv/HS 不需要导入 NS 的 CUDA 扩展。HS 服务器环境需要与当前 MMDetection/MMEngine 兼容的 `torch-dct` 和 `einops`。NS 还需要 `pytorch-wavelets==1.3.0`，并在服务器按实际 PyTorch/CUDA 编译：
+AuxDet/PConv/HS 不需要导入 NS 的 CUDA 扩展。所有实验（包括 E0）都需要公共运行依赖 `einops==0.6.1`，因为 `aux_fpn.py` 顶层直接导入 `rearrange`。该版本与 HS 参考环境一致，当前仓库没有其他版本约束。它已加入 `requirements/runtime.txt`，由 `setup.py` 的 `install_requires` 和根 `requirements.txt` 引用；无需修改 setup.py。HS 额外需要 `torch-dct`，不能把 einops 仅归类为 HS 专用依赖。NS 还需要 `pytorch-wavelets==1.3.0`，并在服务器按实际 PyTorch/CUDA 编译：
 
 ```bash
 cd /root/projects/AUXDET/mmdet/models/necks/sfs_ms_deform_attn
@@ -92,34 +138,32 @@ python setup.py build_ext --inplace
 
 ## 运行命令
 
-先完成下文“公共配置修复验证”中的六组配置解析检查，再按依赖条件运行现有检查脚本的 `--build` 模型构建检查，最后才执行以下真实训练命令。配置解析、模型构建和真实训练验证是三个不同阶段。训练前激活环境并明确设置路径：
+先完成下文“公共配置修复验证”中的六组配置解析检查，再按依赖条件运行现有检查脚本的 `--build` 模型构建检查，最后才执行以下真实训练命令。配置解析、模型构建和真实训练验证是三个不同阶段。训练前先按上文完成公共依赖安装、AuxFPN 导入与数据检查，并激活环境进入仓库：
 
 ```bash
 source /root/anaconda3/etc/profile.d/conda.sh
 conda activate auxdet
 cd /root/projects/AUXDET
-export AUXDET_DATA_ROOT=/root/projects/AUXDET/data
-export AUXDET_RUN_ROOT=/root/projects/AUXDET/work_dirs/graduation
 ```
 
-`AUXDET_RUN_ROOT` 由 shell 展开并通过 `--work-dir` 传入，不会自动由公共配置读取。原始单卡 batch=4 的缩放结果为 `0.02 × 4 / 16 = 0.005`；毕业实验现在固定该默认值，改变 batch size 不会自动调整 LR。
+训练命令直接携带 `AUXDET_DATA_ROOT=/root/projects/AUXDET/data_root`，`--work-dir` 使用完整路径，不依赖 shell 中预先设置输出根目录。原始单卡 batch=4 的缩放结果为 `0.02 × 4 / 16 = 0.005`；毕业实验现在固定该默认值，改变 batch size 不会自动调整 LR。
 
 ```bash
-python tools/train.py configs/graduation/auxdet_base.py --work-dir "$AUXDET_RUN_ROOT/e0" \
-  --cfg-options train_dataloader.batch_size=4 optim_wrapper.optimizer.lr=0.005 auto_scale_lr.enable=False randomness.seed=0
-python tools/train.py configs/graduation/auxdet_pconv.py --work-dir "$AUXDET_RUN_ROOT/e1" \
-  --cfg-options train_dataloader.batch_size=4 optim_wrapper.optimizer.lr=0.005 auto_scale_lr.enable=False randomness.seed=0
-python tools/train.py configs/graduation/auxdet_hsfpn.py --work-dir "$AUXDET_RUN_ROOT/hs" \
-  --cfg-options train_dataloader.batch_size=4 optim_wrapper.optimizer.lr=0.005 auto_scale_lr.enable=False randomness.seed=0
-python tools/train.py configs/graduation/auxdet_nsfpn.py --work-dir "$AUXDET_RUN_ROOT/ns" \
-  --cfg-options train_dataloader.batch_size=4 optim_wrapper.optimizer.lr=0.005 auto_scale_lr.enable=False randomness.seed=0
+AUXDET_DATA_ROOT=/root/projects/AUXDET/data_root python tools/train.py configs/graduation/auxdet_base.py --work-dir "/root/projects/AUXDET/work_dirs/graduation/e0_base_seed42" \
+  --cfg-options train_dataloader.batch_size=4 optim_wrapper.optimizer.lr=0.005 auto_scale_lr.enable=False randomness.seed=42
+AUXDET_DATA_ROOT=/root/projects/AUXDET/data_root python tools/train.py configs/graduation/auxdet_pconv.py --work-dir "/root/projects/AUXDET/work_dirs/graduation/e1" \
+  --cfg-options train_dataloader.batch_size=4 optim_wrapper.optimizer.lr=0.005 auto_scale_lr.enable=False randomness.seed=42
+AUXDET_DATA_ROOT=/root/projects/AUXDET/data_root python tools/train.py configs/graduation/auxdet_hsfpn.py --work-dir "/root/projects/AUXDET/work_dirs/graduation/hs" \
+  --cfg-options train_dataloader.batch_size=4 optim_wrapper.optimizer.lr=0.005 auto_scale_lr.enable=False randomness.seed=42
+AUXDET_DATA_ROOT=/root/projects/AUXDET/data_root python tools/train.py configs/graduation/auxdet_nsfpn.py --work-dir "/root/projects/AUXDET/work_dirs/graduation/ns" \
+  --cfg-options train_dataloader.batch_size=4 optim_wrapper.optimizer.lr=0.005 auto_scale_lr.enable=False randomness.seed=42
 ```
 
 组合配置分别使用 `auxdet_pconv_hsfpn.py` 和 `auxdet_pconv_nsfpn.py`，每个实验使用独立 work directory。学习率、batch size、轮数、数据根目录示例：
 
 ```bash
-python tools/train.py configs/graduation/auxdet_pconv_hsfpn.py \
-  --work-dir "$AUXDET_RUN_ROOT/pconv_hs" \
+AUXDET_DATA_ROOT=/root/projects/AUXDET/data_root python tools/train.py configs/graduation/auxdet_pconv_hsfpn.py \
+  --work-dir "/root/projects/AUXDET/work_dirs/graduation/pconv_hs" \
   --cfg-options \
     optim_wrapper.optimizer.lr=0.01 auto_scale_lr.enable=False \
     train_dataloader.batch_size=2 \
@@ -132,17 +176,17 @@ python tools/train.py configs/graduation/auxdet_pconv_hsfpn.py \
 修改 epoch 时同步修改 `param_scheduler` 中 MultiStepLR 的 `end` 和 `milestones`。训练入口实际支持 `--resume auto` 或 `--resume /path/to/checkpoint.pth`：
 
 ```bash
-python tools/train.py configs/graduation/auxdet_base.py \
-  --work-dir "$AUXDET_RUN_ROOT/e0" --resume auto
-python tools/train.py configs/graduation/auxdet_base.py \
-  --work-dir "$AUXDET_RUN_ROOT/e0" --resume "$AUXDET_RUN_ROOT/e0/epoch_12.pth"
+AUXDET_DATA_ROOT=/root/projects/AUXDET/data_root python tools/train.py configs/graduation/auxdet_base.py \
+  --work-dir "/root/projects/AUXDET/work_dirs/graduation/e0_base_seed42" --resume auto
+AUXDET_DATA_ROOT=/root/projects/AUXDET/data_root python tools/train.py configs/graduation/auxdet_base.py \
+  --work-dir "/root/projects/AUXDET/work_dirs/graduation/e0_base_seed42" --resume "/root/projects/AUXDET/work_dirs/graduation/e0_base_seed42/epoch_12.pth"
 ```
 
 验证：
 
 ```bash
-python tools/test.py configs/graduation/auxdet_base.py "$AUXDET_RUN_ROOT/e0/best_pascal_voc_AP50.pth" \
-  --work-dir "$AUXDET_RUN_ROOT/e0/eval"
+AUXDET_DATA_ROOT=/root/projects/AUXDET/data_root python tools/test.py configs/graduation/auxdet_base.py "/root/projects/AUXDET/work_dirs/graduation/e0_base_seed42/best_pascal_voc_AP50.pth" \
+  --work-dir "/root/projects/AUXDET/work_dirs/graduation/e0_base_seed42/eval"
 ```
 
 实际 checkpoint 文件名以服务器 CheckpointHook 输出为准，不要预先假定一定叫 `best.pth`。每次服务器实验应记录 commit、最终解析配置、seed、完整命令、work_dir 和实际 checkpoint 路径；运行期间不要更新正在使用的源码目录。
@@ -167,7 +211,7 @@ python tools/test.py configs/graduation/auxdet_base.py "$AUXDET_RUN_ROOT/e0/best
 
 ### 服务器待验证
 
-- 六份配置在兼容环境中的解析和 registry 构建。
+- 最新服务器日志已确认毕业设计配置解析成功，`lr=0.005`、自动缩放关闭；完整模型构建仍在 AuxFPN 导入 einops 时失败，需要安装后复核。
 - AuxFPN 重构前后相同输入/元数据的输出对比。
 - 四层内部融合、两层输出、256 通道和 stride `[4,8]`。
 - PConv 非方形输入、残差、冻结、BN 统计、梯度和 optimizer param group。
@@ -177,27 +221,25 @@ python tools/test.py configs/graduation/auxdet_base.py "$AUXDET_RUN_ROOT/e0/best
 
 ### 真实阻塞项
 
-- 服务器已知 Python 3.9、MMEngine 0.10.7，解释器 `/root/anaconda3/envs/auxdet/bin/python`；PyTorch/CUDA/MMCV/编译器版本仍待确认。
-- `torch-dct`、`pytorch-wavelets` 和 `einops` 的兼容版本需要服务器确认。
+- 最新服务器日志记录：Python 3.9.25、PyTorch 2.0.1（CUDA Runtime 11.7）、TorchVision 0.15.2、MMEngine 0.10.7、RTX 3090 Ti；系统 NVCC 13.2、GCC 14.2。解释器为 `/root/anaconda3/envs/auxdet/bin/python`；MMCV 版本仍待确认。上述记录不代表 SFS 已可编译。
+- 公共 einops 已固定为 0.6.1，服务器仍需执行安装和导入验证；HS 的 torch-dct、NS 的 pytorch-wavelets 和 SFS 编译单独验证。
 - NS-FPN 根目录许可证未找到，SFS 迁入发布前仍需核实。
 - 本地无法运行 PyTorch/MMCV 相关检查；NS CUDA 编译和 GPU 运行必须由服务器完成。
 
 ## 公共配置修复验证（2026-10-17）
 
-本次仅修改 `configs/graduation/auxdet_base.py` 和本说明，保留 `configs/_base_/datasets/voc_aux.py` 已有用户修改。公共配置使用 `{{fileDirname}}` 替代配置上下文中未定义的 `__file__`；环境变量缺失或为空时回退到仓库根目录/data_root；三个 dataset 根目录覆盖保持不变。只覆盖 `optim_wrapper.optimizer.lr=0.005` 和 `auto_scale_lr.enable=False`，继承 SGD、momentum、weight_decay、base_batch_size、预热、调度器和默认轮数，不使用 `_delete_`。
+此前公共配置修复仅修改 `configs/graduation/auxdet_base.py` 和本说明，保留当时 `configs/_base_/datasets/voc_aux.py` 已有用户修改；本次依赖修复没有再次修改任何配置。公共配置使用 `{{fileDirname}}` 替代配置上下文中未定义的 `__file__`；环境变量缺失或为空时回退到仓库根目录/data_root；三个 dataset 根目录覆盖保持不变。只覆盖 `optim_wrapper.optimizer.lr=0.005` 和 `auto_scale_lr.enable=False`，继承 SGD、momentum、weight_decay、base_batch_size、预热、调度器和默认轮数，不使用 `_delete_`。
 
 本地状态：**BLOCKED：未执行 Config.fromfile 验证。** 本地解释器缺少 MMEngine。语法检查不代表配置解析通过。以下服务器命令尚未在本次修复中执行，不需要 GPU、模型构建或完整数据集。
 
-先激活环境、设置数据和输出根目录，再优先复用现有检查：
+先激活环境，再通过命令前缀显式传入数据目录，优先复用现有检查：
 
 ```bash
 source /root/anaconda3/etc/profile.d/conda.sh
 conda activate auxdet
 cd /root/projects/AUXDET
-export AUXDET_DATA_ROOT=/root/projects/AUXDET/data
-export AUXDET_RUN_ROOT=/root/projects/AUXDET/work_dirs/graduation
 python -c "import sys, mmengine; print(sys.executable); print(mmengine.__version__)"
-python tools/analysis_tools/check_auxdet_integration.py
+AUXDET_DATA_ROOT=/root/projects/AUXDET/data_root python tools/analysis_tools/check_auxdet_integration.py
 ```
 
 补充检查四种路径场景和 CLI 等效覆盖，每组配置在独立子进程中使用真正的 `Config.fromfile`，失败时保留 traceback 并返回非零：
@@ -237,7 +279,7 @@ print('CONFIG_PARSE_AND_OVERRIDE_OK', path, expected)
 for label, value, cwd in (
     ('unset', None, repo),
     ('empty', '', repo),
-    ('explicit', '/root/projects/AUXDET/data', repo),
+    ('explicit', '/root/projects/AUXDET/data_root', repo),
     ('other_cwd', None, Path('/tmp')),
 ):
     env = os.environ.copy()
@@ -255,3 +297,25 @@ PY
 ```
 
 以上成功只表示真实配置解析、路径和覆盖检查成功；`--build` 才执行模型构建，真实数据上的 loss、反向、checkpoint 和评估需要另行验证。本次没有执行模型构建或训练。
+
+
+## NS-FPN 连续内存布局修复（2026-10-17）
+
+服务器日志已确认 SFS 扩展导入、六组配置解析和模型构建成功。NS 真实训练在 Cascade RPN 的 MMCV `deform_conv_forward` 报 `RuntimeError: input must be contiguous`，训练尚未通过。
+
+`AuxFPNFusion.forward()` 在原输出卷积之后，对返回的两层特征分别调用 `.contiguous()`，确保检测头收到标准连续 NCHW 特征。该操作保持特征值、形状、梯度关系以及检测头和损失不变；同时用于 HS/NS 两种融合分支。无需重新编译 SFS。
+
+本次本地只验证源码语法和 diff；真实张量布局、前向、反向和训练修复效果需服务器确认。先复用检查工具，再启动 NS 训练：
+
+```bash
+cd /root/projects/AUXDET
+conda activate auxdet
+AUXDET_DATA_ROOT=/root/projects/AUXDET/data_root python tools/analysis_tools/check_auxdet_integration.py --build
+AUXDET_DATA_ROOT=/root/projects/AUXDET/data_root CUDA_VISIBLE_DEVICES=0 python tools/train.py \
+  configs/graduation/auxdet_nsfpn.py \
+  --work-dir /root/projects/AUXDET/work_dirs/graduation/e3_nsfpn_seed42 \
+  --cfg-options randomness.seed=42 train_dataloader.batch_size=4 \
+    optim_wrapper.optimizer.lr=0.005 auto_scale_lr.enable=False
+```
+
+公共毕业配置继续使用 `{{fileDirname}}` 计算仓库内 `data_root`，允许通过 `AUXDET_DATA_ROOT` 显式覆盖；服务器命令统一指定 `/root/projects/AUXDET/data_root`。其他通用 MMDetection 数据集示例不属于 AuxDet 数据配置，保留其各自数据集路径。

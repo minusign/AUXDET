@@ -290,4 +290,6 @@ class AuxFPNFusion(AuxFPN):
         laterals = self.fusion_body(laterals)
         # HS/NS bodies include their own fusion top-down path. Do not repeat
         # the original AuxFPN top-down pass after the selected body.
-        return self._build_aux_outputs(inputs, laterals, use_top_down=False)
+        outs = self._build_aux_outputs(inputs, laterals, use_top_down=False)
+        # MMCV DeformConv2d in Cascade RPN requires contiguous NCHW inputs.
+        return tuple(feat.contiguous() for feat in outs)

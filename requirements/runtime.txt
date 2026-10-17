@@ -6,3 +6,4 @@ shapely
 six
 terminaltables
 tqdm
+einops==0.6.1
