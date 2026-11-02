@@ -11,7 +11,7 @@ from mmdet.registry import MODELS
 from mmdet.utils import ConfigType, MultiConfig, OptConfigType
 from einops import rearrange
 
-from mmdet.models.utils import DMLPAttention, FCResLayer
+from mmdet.models.utils import DMLPAttention, FCResLayer, MetadataMoE
 from mmdet.structures import DetDataSample
 
 
@@ -86,7 +86,9 @@ class AuxFPN(BaseModule):
             act_cfg: OptConfigType = None,
             upsample_cfg: ConfigType = dict(mode='nearest'),
             init_cfg: MultiConfig = dict(
-                type='Xavier', layer='Conv2d', distribution='uniform')
+                type='Xavier', layer='Conv2d', distribution='uniform'),
+            enable_moe: bool = False,
+            moe_cfg: OptConfigType = None,
     ) -> None:
         super().__init__(init_cfg=init_cfg)
         assert isinstance(in_channels, list)
@@ -193,6 +195,24 @@ class AuxFPN(BaseModule):
             nn.Sigmoid()  # 限制权重范围在 (0,1)
         )
 
+        self.enable_moe = enable_moe
+        if self.enable_moe:
+            moe_cfg = {} if moe_cfg is None else moe_cfg.copy()
+            expected_router_dim = out_channels // 2
+            if ('feature_channels' in moe_cfg
+                    and moe_cfg['feature_channels'] != out_channels):
+                raise ValueError(
+                    'moe_cfg.feature_channels must equal out_channels.')
+            if ('router_input_dim' in moe_cfg
+                    and moe_cfg['router_input_dim'] != expected_router_dim):
+                raise ValueError(
+                    'moe_cfg.router_input_dim must equal out_channels // 2.')
+            moe_cfg['feature_channels'] = out_channels
+            moe_cfg['router_input_dim'] = expected_router_dim
+            self.meta_moes = nn.ModuleList([
+                MetadataMoE(**moe_cfg) for _ in range(2)
+            ])
+
     def forward(self, inputs: Tuple[Tensor], meta_inf: List[DetDataSample]) -> Tuple[Tensor]:
         """Forward function.
 
@@ -239,6 +259,10 @@ class AuxFPN(BaseModule):
 
             # step 6. 融合调制后的特征
             laterals[idx] = laterals[idx] + s + c
+
+            if self.enable_moe:
+                laterals[idx] = self.meta_moes[idx](
+                    laterals[idx], all_aux_fea)
 
         # 进行边缘增强
         edge_features = [

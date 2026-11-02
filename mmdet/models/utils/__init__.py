@@ -21,6 +21,7 @@ from .point_sample import (get_uncertain_point_coords_with_randomness,
 from .vlfuse_helper import BertEncoderLayer, VLFuse, permute_and_flatten
 from .wbf import weighted_boxes_fusion
 from .dynamic_mlp import DMLPAttention, FCResLayer
+from .metadata_moe import MetadataExpert, MetadataMoE, MetadataRouter
 
 __all__ = [
     'gaussian_radius', 'gen_gaussian_target', 'make_divisible',
@@ -35,5 +36,6 @@ __all__ = [
     'reweight_loss_dict', 'relative_coordinate_maps', 'aligned_bilinear',
     'unfold_wo_center', 'imrenormalize', 'VLFuse', 'permute_and_flatten',
     'BertEncoderLayer', 'align_tensor', 'weighted_boxes_fusion',
-    "DMLPAttention", 'FCResLayer'
+    "DMLPAttention", 'FCResLayer', 'MetadataRouter', 'MetadataExpert',
+    'MetadataMoE'
 ]
