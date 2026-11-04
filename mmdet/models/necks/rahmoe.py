@@ -267,7 +267,10 @@ class RAHMoE(nn.Module):
 
         out = x + self.gamma_shared * shared + self.gamma_routed * routed
 
-        if self.compute_aux_loss:
+        # The neck is also used by validation and inference through the same
+        # feature-extraction path.  Auxiliary routing regularization is a
+        # training-only loss and must not be computed in eval mode.
+        if self.compute_aux_loss and self.training:
             self.aux_loss = self._compute_aux(gates, logits, expert_stack)
         else:
             self.aux_loss = None
@@ -296,6 +299,12 @@ class RAHMoE(nn.Module):
         return out, vis
 
     def _compute_aux(self, gates, logits, experts):
+        # Keep the original formulas while evaluating their reductions in
+        # float32.  This avoids half-precision underflow/overflow in log,
+        # normalization and logsumexp without detaching the graph.
+        gates = gates.float()
+        logits = logits.float()
+        experts = experts.float()
         E = self.num_experts
 
         #  balance:  prevent collapse to a single expert

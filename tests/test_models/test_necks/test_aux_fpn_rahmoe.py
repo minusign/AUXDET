@@ -66,6 +66,37 @@ def test_rahmoe_aux_loss_switch():
     assert enabled.aux_loss is not None
     assert torch.isfinite(enabled.aux_loss)
 
+    enabled.eval()
+    enabled(x)
+    assert enabled.aux_loss is None
+
+
+def test_two_stage_loss_exposes_rahmoe_aux_loss():
+    from mmdet.models.detectors.two_stage import TwoStageDetector
+
+    class Sample:
+        def get(self, key, default=None):
+            return 'proposals' if key == 'proposals' else default
+
+    class RoiHead:
+        def loss(self, x, proposals, data_samples):
+            return dict(loss_roi=torch.tensor(2.0))
+
+    detector = TwoStageDetector.__new__(TwoStageDetector)
+    detector.extract_feat = lambda inputs, samples: ('feature',)
+    detector.neck = type('Neck', (), {
+        'moe_aux_loss': torch.tensor(0.25, requires_grad=True)
+    })()
+    detector.roi_head = RoiHead()
+    losses = detector.loss(torch.tensor(0.0), [Sample()])
+
+    assert losses['loss_roi'].item() == 2.0
+    assert losses['loss_rahmoe_aux'] is detector.neck.moe_aux_loss
+
+    detector.neck.moe_aux_loss = None
+    losses_without_aux = detector.loss(torch.tensor(0.0), [Sample()])
+    assert 'loss_rahmoe_aux' not in losses_without_aux
+
 
 def test_aux_fpn_rahmoe_switch_and_output_count():
     from mmdet.models.necks.aux_fpn import AuxFPN
@@ -89,6 +120,7 @@ def test_aux_fpn_rahmoe_switch_and_output_count():
     assert len(disabled_outs) == 2
     for baseline_out, disabled_out in zip(baseline_outs, disabled_outs):
         torch.testing.assert_close(baseline_out, disabled_out)
+    assert disabled.moe_aux_loss is None
 
     enabled = AuxFPN(
         **kwargs,

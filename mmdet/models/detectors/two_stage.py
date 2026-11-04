@@ -206,6 +206,16 @@ class TwoStageDetector(BaseDetector):
                                         batch_data_samples)
         losses.update(roi_losses)
 
+        # AuxFPN exposes the single enabled RAHMoE regularization loss.  It
+        # remains connected to the routing/expert graph and is added as a
+        # normal loss entry, so MMEngine includes it in the total objective.
+        # Disabled RAHMoE, eval/inference, and compute_aux_loss=False all
+        # produce None and therefore add no spurious loss term.
+        neck = getattr(self, 'neck', None)
+        moe_aux_loss = getattr(neck, 'moe_aux_loss', None)
+        if moe_aux_loss is not None:
+            losses['loss_rahmoe_aux'] = moe_aux_loss
+
         return losses
 
     def predict(self,

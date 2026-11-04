@@ -102,6 +102,7 @@ class AuxFPN(BaseModule):
         self.no_norm_on_lateral = no_norm_on_lateral
         self.fp16_enabled = False
         self.upsample_cfg = upsample_cfg.copy()
+        self.moe_aux_loss = None
 
         if rahmoe_level != 1:
             raise ValueError('AuxFPN currently supports rahmoe_level=1 only.')
@@ -285,6 +286,9 @@ class AuxFPN(BaseModule):
         if self.enable_rahmoe:
             laterals[self.rahmoe_level] = self.rahmoe(
                 laterals[self.rahmoe_level])
+            self.moe_aux_loss = self.rahmoe.aux_loss
+        else:
+            self.moe_aux_loss = None
 
         outs = [
             self.fpn_convs[i](laterals[i]) for i in range(used_backbone_levels)
