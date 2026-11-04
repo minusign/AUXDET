@@ -13,6 +13,7 @@ from einops import rearrange
 
 from mmdet.models.utils import DMLPAttention, FCResLayer
 from mmdet.structures import DetDataSample
+from .rahmoe import RAHMoE
 
 
 @MODELS.register_module()
@@ -85,6 +86,9 @@ class AuxFPN(BaseModule):
             norm_cfg: OptConfigType = None,
             act_cfg: OptConfigType = None,
             upsample_cfg: ConfigType = dict(mode='nearest'),
+            enable_rahmoe: bool = False,
+            rahmoe_level: int = 1,
+            rahmoe_cfg: OptConfigType = None,
             init_cfg: MultiConfig = dict(
                 type='Xavier', layer='Conv2d', distribution='uniform')
     ) -> None:
@@ -98,6 +102,11 @@ class AuxFPN(BaseModule):
         self.no_norm_on_lateral = no_norm_on_lateral
         self.fp16_enabled = False
         self.upsample_cfg = upsample_cfg.copy()
+
+        if rahmoe_level != 1:
+            raise ValueError('AuxFPN currently supports rahmoe_level=1 only.')
+        self.enable_rahmoe = enable_rahmoe
+        self.rahmoe_level = rahmoe_level
 
         if end_level == -1 or end_level == self.num_ins - 1:
             self.backbone_end_level = self.num_ins
@@ -193,6 +202,15 @@ class AuxFPN(BaseModule):
             nn.Sigmoid()  # 限制权重范围在 (0,1)
         )
 
+        if self.enable_rahmoe:
+            rahmoe_cfg = {} if rahmoe_cfg is None else rahmoe_cfg.copy()
+            if 'dim' in rahmoe_cfg:
+                if rahmoe_cfg['dim'] != out_channels:
+                    raise ValueError(
+                        'rahmoe_cfg.dim must equal AuxFPN out_channels.')
+                rahmoe_cfg.pop('dim')
+            self.rahmoe = RAHMoE(dim=out_channels, **rahmoe_cfg)
+
     def forward(self, inputs: Tuple[Tensor], meta_inf: List[DetDataSample]) -> Tuple[Tensor]:
         """Forward function.
 
@@ -263,6 +281,10 @@ class AuxFPN(BaseModule):
                 prev_shape = laterals[i - 1].shape[2:]
                 laterals[i - 1] = laterals[i - 1] + F.interpolate(
                     laterals[i], size=prev_shape, **self.upsample_cfg)
+
+        if self.enable_rahmoe:
+            laterals[self.rahmoe_level] = self.rahmoe(
+                laterals[self.rahmoe_level])
 
         outs = [
             self.fpn_convs[i](laterals[i]) for i in range(used_backbone_levels)
