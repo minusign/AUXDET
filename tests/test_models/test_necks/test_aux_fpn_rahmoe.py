@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -251,3 +252,56 @@ def test_invalid_rahmoe_position_raises():
     with pytest.raises(ValueError, match='rahmoe_position'):
         AuxFPN(in_channels=[8] * 4, out_channels=8, num_outs=4,
                rahmoe_position='unknown')
+
+
+@pytest.mark.parametrize('position', ['post_topdown', 'mid_topdown'])
+def test_eval_rahmoe_bypass_only_skips_eval_call(position):
+    from mmdet.models.necks.aux_fpn import AuxFPN
+
+    model = AuxFPN(
+        in_channels=[8] * 4,
+        out_channels=8,
+        num_outs=4,
+        enable_rahmoe=True,
+        rahmoe_position=position,
+        rahmoe_eval_bypass=False,
+    )
+    inputs, samples = _aux_inputs(channels=8), _samples()
+    state_keys = tuple(model.state_dict().keys())
+
+    model.eval()
+    with patch.object(model.rahmoe, 'forward',
+                      wraps=model.rahmoe.forward) as forward:
+        outputs = model(inputs, samples)
+    assert forward.call_count == 1
+    assert len(outputs) == 2
+
+    model.rahmoe_eval_bypass = True
+    with patch.object(model.rahmoe, 'forward',
+                      wraps=model.rahmoe.forward) as forward:
+        bypass_outputs = model(inputs, samples)
+    assert forward.call_count == 0
+    assert [tuple(x.shape) for x in bypass_outputs] == [
+        tuple(x.shape) for x in outputs]
+    assert model.moe_aux_loss is None
+
+    model.train()
+    with patch.object(model.rahmoe, 'forward',
+                      wraps=model.rahmoe.forward) as forward:
+        train_outputs = model(inputs, samples)
+    assert forward.call_count == 1
+    assert [tuple(x.shape) for x in train_outputs] == [
+        tuple(x.shape) for x in outputs]
+    assert tuple(model.state_dict().keys()) == state_keys
+
+
+def test_eval_bypass_default_is_disabled_and_does_not_change_state_dict():
+    from mmdet.models.necks.aux_fpn import AuxFPN
+
+    model = AuxFPN(in_channels=[8] * 4, out_channels=8, num_outs=4,
+                   enable_rahmoe=True)
+    assert model.rahmoe_eval_bypass is False
+    before = tuple(model.state_dict().keys())
+    model.rahmoe_eval_bypass = True
+    after = tuple(model.state_dict().keys())
+    assert before == after

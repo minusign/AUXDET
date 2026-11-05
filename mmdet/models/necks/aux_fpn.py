@@ -56,6 +56,8 @@ class AuxFPN(BaseModule):
         rahmoe_position (str): Apply RAHMoE after all top-down additions
             ('post_topdown') or immediately after fusion into lateral level 1
             ('mid_topdown'). Defaults to 'post_topdown'.
+        rahmoe_eval_bypass (bool): When true, skip the RAHMoE call only while
+            the neck is in evaluation mode. Defaults to False.
         init_cfg (:obj:`ConfigDict` or dict or list[:obj:`ConfigDict` or \
             dict]): Initialization config dict.
 
@@ -95,6 +97,7 @@ class AuxFPN(BaseModule):
             init_cfg: MultiConfig = dict(
                 type='Xavier', layer='Conv2d', distribution='uniform'),
             rahmoe_position: str = 'post_topdown',
+            rahmoe_eval_bypass: bool = False,
     ) -> None:
         super().__init__(init_cfg=init_cfg)
         assert isinstance(in_channels, list)
@@ -116,6 +119,7 @@ class AuxFPN(BaseModule):
             raise ValueError(
                 'rahmoe_position must be post_topdown or mid_topdown.')
         self.rahmoe_position = rahmoe_position
+        self.rahmoe_eval_bypass = rahmoe_eval_bypass
 
         if end_level == -1 or end_level == self.num_ins - 1:
             self.backbone_end_level = self.num_ins
@@ -296,17 +300,21 @@ class AuxFPN(BaseModule):
                     laterals[i], size=prev_shape, **self.upsample_cfg)
 
             # Enhance level 1 before the next iteration propagates it to P2.
-            if (self.enable_rahmoe
+            if (self.enable_rahmoe and
+                    (self.training or not self.rahmoe_eval_bypass)
                     and self.rahmoe_position == 'mid_topdown'
                     and i - 1 == self.rahmoe_level):
                 laterals[self.rahmoe_level] = self.rahmoe(
                     laterals[self.rahmoe_level])
 
-        if self.enable_rahmoe and self.rahmoe_position == 'post_topdown':
+        if (self.enable_rahmoe
+                and (self.training or not self.rahmoe_eval_bypass)
+                and self.rahmoe_position == 'post_topdown'):
             laterals[self.rahmoe_level] = self.rahmoe(
                 laterals[self.rahmoe_level])
 
-        if self.enable_rahmoe:
+        if (self.enable_rahmoe
+                and (self.training or not self.rahmoe_eval_bypass)):
             self.moe_aux_loss = self.rahmoe.aux_loss
         else:
             self.moe_aux_loss = None
