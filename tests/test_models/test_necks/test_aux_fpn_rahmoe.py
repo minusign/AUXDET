@@ -83,6 +83,7 @@ def test_two_stage_loss_exposes_rahmoe_aux_loss():
             return dict(loss_roi=torch.tensor(2.0))
 
     detector = TwoStageDetector.__new__(TwoStageDetector)
+    torch.nn.Module.__init__(detector)
     detector.extract_feat = lambda inputs, samples: ('feature',)
     detector.neck = type('Neck', (), {
         'moe_aux_loss': torch.tensor(0.25, requires_grad=True)
@@ -98,7 +99,8 @@ def test_two_stage_loss_exposes_rahmoe_aux_loss():
     assert 'loss_rahmoe_aux' not in losses_without_aux
 
 
-def test_aux_fpn_rahmoe_switch_and_output_count():
+@pytest.mark.parametrize('position', ['post_topdown', 'mid_topdown'])
+def test_aux_fpn_rahmoe_switch_and_output_count(position):
     from mmdet.models.necks.aux_fpn import AuxFPN
 
     kwargs = dict(
@@ -112,7 +114,8 @@ def test_aux_fpn_rahmoe_switch_and_output_count():
     samples = _samples()
 
     baseline = AuxFPN(**kwargs, enable_rahmoe=False).eval()
-    disabled = AuxFPN(**kwargs, enable_rahmoe=False).eval()
+    disabled = AuxFPN(**kwargs, enable_rahmoe=False,
+                      rahmoe_position=position).eval()
     disabled.load_state_dict(baseline.state_dict())
     assert not hasattr(disabled, 'rahmoe')
     baseline_outs = baseline(inputs, samples)
@@ -126,6 +129,7 @@ def test_aux_fpn_rahmoe_switch_and_output_count():
         **kwargs,
         enable_rahmoe=True,
         rahmoe_level=1,
+        rahmoe_position=position,
         rahmoe_cfg=dict(compute_aux_loss=False),
     ).eval()
     enabled_outs = enabled(inputs, samples)
@@ -144,3 +148,106 @@ def test_aux_fpn_rahmoe_config_parses_and_builds_when_dependencies_available():
     assert cfg.model.neck.rahmoe_level == 1
     assert cfg.model.neck.rahmoe_cfg.compute_aux_loss is False
     MODELS.build(cfg.model.neck)
+
+
+@pytest.mark.parametrize('upsample_cfg', [
+    dict(mode='nearest'), dict(mode='nearest', scale_factor=2)
+])
+@pytest.mark.parametrize('position', ['post_topdown', 'mid_topdown'])
+def test_rahmoe_position_propagation_and_single_call(position, upsample_cfg):
+    from mmdet.models.necks.aux_fpn import AuxFPN
+
+    class AddOne(torch.nn.Module):
+        """Known perturbation to verify the actual top-down data flow."""
+        def __init__(self):
+            super().__init__()
+            self.shift = torch.nn.Parameter(torch.tensor(1.0))
+            self.calls = 0
+            self.aux_loss = None
+
+        def forward(self, x):
+            self.calls += 1
+            assert x.shape == (2, 8, 8, 8)
+            return x + self.shift
+
+    kwargs = dict(in_channels=[8] * 4, out_channels=8, num_outs=4,
+                  upsample_cfg=upsample_cfg)
+    baseline = AuxFPN(**kwargs).eval()
+    enabled = AuxFPN(**kwargs, enable_rahmoe=True,
+                     rahmoe_position=position).eval()
+    enabled.rahmoe = AddOne()
+    # Keep every original weight identical; replace only output convolutions
+    # with identity to observe the exact lateral perturbation before them.
+    result = enabled.load_state_dict(baseline.state_dict(), strict=False)
+    assert result.missing_keys == ['rahmoe.shift']
+    assert not result.unexpected_keys
+    baseline.fpn_convs = torch.nn.ModuleList([
+        torch.nn.Identity() for _ in range(4)])
+    enabled.fpn_convs = torch.nn.ModuleList([
+        torch.nn.Identity() for _ in range(4)])
+    inputs, samples = _aux_inputs(), _samples()
+    with torch.no_grad():
+        reference = baseline(inputs, samples)
+    outs = enabled(inputs, samples)
+    assert enabled.rahmoe.calls == 1
+    assert len(outs) == 2
+    torch.testing.assert_close(outs[1], reference[1] + 1,
+                               atol=1e-5, rtol=1e-5)
+    expected_p2 = reference[0] + (1 if position == 'mid_topdown' else 0)
+    torch.testing.assert_close(outs[0], expected_p2, atol=1e-5, rtol=1e-5)
+    # P2 depends on the MoE perturbation only with the new position.
+    grad, = torch.autograd.grad(outs[0].sum(), enabled.rahmoe.shift,
+                                allow_unused=True)
+    if position == 'mid_topdown':
+        assert grad is not None and torch.isfinite(grad) and grad != 0
+    else:
+        assert grad is None
+
+
+def test_auxiliary_loss_alone_reaches_router_and_experts():
+    module = RAHMoE(dim=8, compute_aux_loss=True).train()
+    module(torch.randn(2, 8, 8, 8))
+    aux = module.aux_loss
+    assert aux.grad_fn is not None
+    assert torch.isfinite(aux) and aux > 0
+    aux.backward()
+    for group in (module.router, *module.experts):
+        grads = [p.grad for p in group.parameters() if p.grad is not None]
+        assert grads and all(torch.isfinite(g).all() for g in grads)
+        assert sum(g.abs().sum().item() for g in grads) > 0
+    assert set(module.aux_loss_logs) == {
+        'balance', 'diversity', 'entropy', 'zloss'}
+    assert all(not v.requires_grad for v in module.aux_loss_logs.values())
+
+
+def test_midfpn_config_preserves_training_and_state_dict():
+    from pathlib import Path
+
+    from mmdet.registry import MODELS
+
+    root = Path(__file__).resolve().parents[4]
+    config_dir = root / 'configs' / 'auxdet'
+    old = Config.fromfile(str(
+        config_dir / 'auxdet_r50_fpn_1x_voc_rahmoe_aux.py'))
+    new = Config.fromfile(str(
+        config_dir / 'auxdet_r50_fpn_1x_voc_rahmoe_aux_midfpn.py'))
+    assert new.model.neck.rahmoe_position == 'mid_topdown'
+    assert new.log_processor.num_digits == 8
+    assert new.load_from is None and new.resume is False
+    assert new.model.backbone.init_cfg.checkpoint == 'torchvision://resnet50'
+    assert new.model.neck.rahmoe_cfg == old.model.neck.rahmoe_cfg
+    for key in ('train_cfg', 'optim_wrapper', 'param_scheduler',
+                'train_dataloader', 'val_evaluator'):
+        assert new[key] == old[key]
+    previous, current = MODELS.build(old.model.neck), MODELS.build(new.model.neck)
+    current.load_state_dict(previous.state_dict(), strict=True)
+    assert previous.rahmoe_position == 'post_topdown'
+    assert current.rahmoe_position == 'mid_topdown'
+
+
+def test_invalid_rahmoe_position_raises():
+    from mmdet.models.necks.aux_fpn import AuxFPN
+
+    with pytest.raises(ValueError, match='rahmoe_position'):
+        AuxFPN(in_channels=[8] * 4, out_channels=8, num_outs=4,
+               rahmoe_position='unknown')

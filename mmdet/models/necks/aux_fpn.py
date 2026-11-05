@@ -53,6 +53,9 @@ class AuxFPN(BaseModule):
             activation layer in ConvModule. Defaults to None.
         upsample_cfg (:obj:`ConfigDict` or dict, optional): Config dict
             for interpolate layer. Defaults to dict(mode='nearest').
+        rahmoe_position (str): Apply RAHMoE after all top-down additions
+            ('post_topdown') or immediately after fusion into lateral level 1
+            ('mid_topdown'). Defaults to 'post_topdown'.
         init_cfg (:obj:`ConfigDict` or dict or list[:obj:`ConfigDict` or \
             dict]): Initialization config dict.
 
@@ -90,7 +93,8 @@ class AuxFPN(BaseModule):
             rahmoe_level: int = 1,
             rahmoe_cfg: OptConfigType = None,
             init_cfg: MultiConfig = dict(
-                type='Xavier', layer='Conv2d', distribution='uniform')
+                type='Xavier', layer='Conv2d', distribution='uniform'),
+            rahmoe_position: str = 'post_topdown',
     ) -> None:
         super().__init__(init_cfg=init_cfg)
         assert isinstance(in_channels, list)
@@ -108,6 +112,10 @@ class AuxFPN(BaseModule):
             raise ValueError('AuxFPN currently supports rahmoe_level=1 only.')
         self.enable_rahmoe = enable_rahmoe
         self.rahmoe_level = rahmoe_level
+        if rahmoe_position not in ('post_topdown', 'mid_topdown'):
+            raise ValueError(
+                'rahmoe_position must be post_topdown or mid_topdown.')
+        self.rahmoe_position = rahmoe_position
 
         if end_level == -1 or end_level == self.num_ins - 1:
             self.backbone_end_level = self.num_ins
@@ -119,6 +127,10 @@ class AuxFPN(BaseModule):
             assert num_outs == end_level - start_level + 1
         self.start_level = start_level
         self.end_level = end_level
+        if (self.enable_rahmoe and self.rahmoe_position == 'mid_topdown'
+                and self.backbone_end_level - self.start_level < 3):
+            raise ValueError('mid_topdown requires a deeper lateral level '
+                             'to fuse into rahmoe_level=1.')
         self.add_extra_convs = add_extra_convs
         assert isinstance(add_extra_convs, (str, bool))
         if isinstance(add_extra_convs, str):
@@ -283,9 +295,18 @@ class AuxFPN(BaseModule):
                 laterals[i - 1] = laterals[i - 1] + F.interpolate(
                     laterals[i], size=prev_shape, **self.upsample_cfg)
 
-        if self.enable_rahmoe:
+            # Enhance level 1 before the next iteration propagates it to P2.
+            if (self.enable_rahmoe
+                    and self.rahmoe_position == 'mid_topdown'
+                    and i - 1 == self.rahmoe_level):
+                laterals[self.rahmoe_level] = self.rahmoe(
+                    laterals[self.rahmoe_level])
+
+        if self.enable_rahmoe and self.rahmoe_position == 'post_topdown':
             laterals[self.rahmoe_level] = self.rahmoe(
                 laterals[self.rahmoe_level])
+
+        if self.enable_rahmoe:
             self.moe_aux_loss = self.rahmoe.aux_loss
         else:
             self.moe_aux_loss = None

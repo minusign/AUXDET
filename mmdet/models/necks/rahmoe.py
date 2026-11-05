@@ -252,6 +252,7 @@ class RAHMoE(nn.Module):
         self.entropy_target   = entropy_target
 
         self.aux_loss  = None
+        self.aux_loss_logs = {}
         self.route_logs = {}
 
     def forward(self, x, return_vis=False):
@@ -270,6 +271,7 @@ class RAHMoE(nn.Module):
         # The neck is also used by validation and inference through the same
         # feature-extraction path.  Auxiliary routing regularization is a
         # training-only loss and must not be computed in eval mode.
+        self.aux_loss_logs = {}
         if self.compute_aux_loss and self.training:
             self.aux_loss = self._compute_aux(gates, logits, expert_stack)
         else:
@@ -323,6 +325,15 @@ class RAHMoE(nn.Module):
 
         #  z-loss:  stabilise router logit magnitude
         zloss = torch.logsumexp(logits, dim=1).pow(2).mean()
+
+        # Detached scalars for diagnosis only; the returned loss below keeps
+        # its original graph and coefficients. Never retain full activations.
+        self.aux_loss_logs = {
+            'balance': balance.detach(),
+            'diversity': diversity.detach(),
+            'entropy': entropy_loss.detach(),
+            'zloss': zloss.detach(),
+        }
 
         return (self.balance_weight * balance
                 + self.diversity_weight * diversity
