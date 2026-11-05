@@ -54,10 +54,15 @@ class AuxFPN(BaseModule):
         upsample_cfg (:obj:`ConfigDict` or dict, optional): Config dict
             for interpolate layer. Defaults to dict(mode='nearest').
         rahmoe_position (str): Apply RAHMoE after all top-down additions
-            ('post_topdown') or immediately after fusion into lateral level 1
-            ('mid_topdown'). Defaults to 'post_topdown'.
+            ('post_topdown'), immediately after fusion into lateral level 1
+            ('mid_topdown'), or through a reduced-channel P2 bottleneck after
+            top-down fusion ('p2_bottleneck'). Defaults to 'post_topdown'.
         rahmoe_eval_bypass (bool): When true, skip the RAHMoE call only while
             the neck is in evaluation mode. Defaults to False.
+        rahmoe_bottleneck_dim (int): RAHMoE channel dimension for the
+            ``p2_bottleneck`` position. Defaults to 64.
+        p2_residual_scale_init (float): Initial value of the learnable P2
+            residual scale in ``p2_bottleneck`` mode. Defaults to 1.0.
         init_cfg (:obj:`ConfigDict` or dict or list[:obj:`ConfigDict` or \
             dict]): Initialization config dict.
 
@@ -98,6 +103,8 @@ class AuxFPN(BaseModule):
                 type='Xavier', layer='Conv2d', distribution='uniform'),
             rahmoe_position: str = 'post_topdown',
             rahmoe_eval_bypass: bool = False,
+            rahmoe_bottleneck_dim: int = 64,
+            p2_residual_scale_init: float = 1.0,
     ) -> None:
         super().__init__(init_cfg=init_cfg)
         assert isinstance(in_channels, list)
@@ -111,15 +118,27 @@ class AuxFPN(BaseModule):
         self.upsample_cfg = upsample_cfg.copy()
         self.moe_aux_loss = None
 
-        if rahmoe_level != 1:
-            raise ValueError('AuxFPN currently supports rahmoe_level=1 only.')
         self.enable_rahmoe = enable_rahmoe
         self.rahmoe_level = rahmoe_level
-        if rahmoe_position not in ('post_topdown', 'mid_topdown'):
+        if rahmoe_position not in ('post_topdown', 'mid_topdown',
+                                   'p2_bottleneck'):
             raise ValueError(
-                'rahmoe_position must be post_topdown or mid_topdown.')
+                'rahmoe_position must be post_topdown, mid_topdown, or '
+                'p2_bottleneck.')
         self.rahmoe_position = rahmoe_position
         self.rahmoe_eval_bypass = rahmoe_eval_bypass
+        self.rahmoe_bottleneck_dim = rahmoe_bottleneck_dim
+        self.p2_residual_scale_init = p2_residual_scale_init
+
+        if rahmoe_position == 'p2_bottleneck':
+            if rahmoe_level != 0:
+                raise ValueError(
+                    'p2_bottleneck requires rahmoe_level=0.')
+            if rahmoe_bottleneck_dim <= 0:
+                raise ValueError('rahmoe_bottleneck_dim must be positive.')
+        elif rahmoe_level != 1:
+            raise ValueError(
+                'post_topdown and mid_topdown require rahmoe_level=1.')
 
         if end_level == -1 or end_level == self.num_ins - 1:
             self.backbone_end_level = self.num_ins
@@ -221,12 +240,22 @@ class AuxFPN(BaseModule):
 
         if self.enable_rahmoe:
             rahmoe_cfg = {} if rahmoe_cfg is None else rahmoe_cfg.copy()
+            rahmoe_dim = out_channels
+            if self.rahmoe_position == 'p2_bottleneck':
+                self.p2_down = nn.Conv2d(
+                    out_channels, rahmoe_bottleneck_dim, kernel_size=1)
+                self.p2_up = nn.Conv2d(
+                    rahmoe_bottleneck_dim, out_channels, kernel_size=1)
+                self.p2_res_scale = nn.Parameter(
+                    torch.tensor(float(p2_residual_scale_init)))
+                rahmoe_dim = rahmoe_bottleneck_dim
             if 'dim' in rahmoe_cfg:
-                if rahmoe_cfg['dim'] != out_channels:
+                if rahmoe_cfg['dim'] != rahmoe_dim:
                     raise ValueError(
-                        'rahmoe_cfg.dim must equal AuxFPN out_channels.')
+                        'rahmoe_cfg.dim must equal the selected RAHMoE '
+                        'feature dimension.')
                 rahmoe_cfg.pop('dim')
-            self.rahmoe = RAHMoE(dim=out_channels, **rahmoe_cfg)
+            self.rahmoe = RAHMoE(dim=rahmoe_dim, **rahmoe_cfg)
 
     def forward(self, inputs: Tuple[Tensor], meta_inf: List[DetDataSample]) -> Tuple[Tensor]:
         """Forward function.
@@ -312,6 +341,15 @@ class AuxFPN(BaseModule):
                 and self.rahmoe_position == 'post_topdown'):
             laterals[self.rahmoe_level] = self.rahmoe(
                 laterals[self.rahmoe_level])
+
+        if (self.enable_rahmoe
+                and (self.training or not self.rahmoe_eval_bypass)
+                and self.rahmoe_position == 'p2_bottleneck'):
+            p2 = laterals[0]
+            p2_reduced = self.p2_down(p2)
+            p2_moe = self.rahmoe(p2_reduced)
+            p2_delta = p2_moe - p2_reduced
+            laterals[0] = p2 + self.p2_res_scale * self.p2_up(p2_delta)
 
         if (self.enable_rahmoe
                 and (self.training or not self.rahmoe_eval_bypass)):

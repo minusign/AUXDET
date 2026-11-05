@@ -305,3 +305,112 @@ def test_eval_bypass_default_is_disabled_and_does_not_change_state_dict():
     model.rahmoe_eval_bypass = True
     after = tuple(model.state_dict().keys())
     assert before == after
+
+
+def _build_p2_neck(**overrides):
+    from mmdet.models.necks.aux_fpn import AuxFPN
+
+    kwargs = dict(
+        in_channels=[8] * 4,
+        out_channels=8,
+        num_outs=4,
+        enable_rahmoe=True,
+        rahmoe_level=0,
+        rahmoe_position='p2_bottleneck',
+        rahmoe_bottleneck_dim=2,
+        rahmoe_cfg=dict(compute_aux_loss=True),
+    )
+    kwargs.update(overrides)
+    return AuxFPN(**kwargs)
+
+
+def test_p2_bottleneck_shape_single_call_and_eval_bypass():
+    model = _build_p2_neck().eval()
+    inputs, samples = _aux_inputs(channels=8), _samples()
+    keys = tuple(model.state_dict().keys())
+    assert model.p2_res_scale.item() == 1.0
+
+    with patch.object(model.rahmoe, 'forward',
+                      wraps=model.rahmoe.forward) as forward:
+        outputs = model(inputs, samples)
+    assert forward.call_count == 1
+    assert len(outputs) == 2
+    assert outputs[0].shape == (2, 8, 16, 16)
+    assert outputs[1].shape == (2, 8, 8, 8)
+
+    model.rahmoe_eval_bypass = True
+    with patch.object(model.rahmoe, 'forward',
+                      wraps=model.rahmoe.forward) as forward:
+        bypass_outputs = model(inputs, samples)
+    assert forward.call_count == 0
+    assert [tuple(x.shape) for x in bypass_outputs] == [
+        tuple(x.shape) for x in outputs]
+    assert model.moe_aux_loss is None
+    assert tuple(model.state_dict().keys()) == keys
+
+
+def test_p2_bottleneck_backward_reaches_projection_moe_and_scale():
+    model = _build_p2_neck().train()
+    outputs = model(*(_aux_inputs(channels=8), _samples()))
+    assert model.moe_aux_loss is not None
+    total = sum(output.sum() for output in outputs) + model.moe_aux_loss
+    total.backward()
+
+    for module in (model.p2_down, model.p2_up, model.rahmoe.router):
+        grads = [p.grad for p in module.parameters() if p.requires_grad]
+        assert grads and all(g is not None for g in grads)
+        assert all(torch.isfinite(g).all() for g in grads)
+    for expert in model.rahmoe.experts:
+        grads = [p.grad for p in expert.parameters() if p.requires_grad]
+        assert grads and any(g is not None for g in grads)
+    assert model.p2_res_scale.grad is not None
+    assert torch.isfinite(model.p2_res_scale.grad)
+
+
+def test_p2_only_changes_p2_output_and_old_positions_still_build():
+    from mmdet.models.necks.aux_fpn import AuxFPN
+
+    inputs, samples = _aux_inputs(channels=8), _samples()
+    baseline = AuxFPN(in_channels=[8] * 4, out_channels=8,
+                      num_outs=4).eval()
+    p2 = _build_p2_neck().eval()
+    p2.load_state_dict(baseline.state_dict(), strict=False)
+    with torch.no_grad():
+        baseline_outputs = baseline(inputs, samples)
+        p2_outputs = p2(inputs, samples)
+    torch.testing.assert_close(p2_outputs[1], baseline_outputs[1])
+
+    disabled_p2 = AuxFPN(
+        in_channels=[8] * 4, out_channels=8, num_outs=4,
+        enable_rahmoe=False, rahmoe_level=0,
+        rahmoe_position='p2_bottleneck').eval()
+    disabled_p2.load_state_dict(baseline.state_dict())
+    with torch.no_grad():
+        disabled_outputs = disabled_p2(inputs, samples)
+    for expected, actual in zip(baseline_outputs, disabled_outputs):
+        torch.testing.assert_close(expected, actual)
+    assert not hasattr(disabled_p2, 'p2_down')
+    assert not hasattr(disabled_p2, 'rahmoe')
+
+    for position in ('post_topdown', 'mid_topdown'):
+        old = AuxFPN(in_channels=[8] * 4, out_channels=8, num_outs=4,
+                     enable_rahmoe=True, rahmoe_level=1,
+                     rahmoe_position=position,
+                     rahmoe_cfg=dict(compute_aux_loss=False)).eval()
+        assert old.rahmoe_position == position
+        assert old.rahmoe_level == 1
+
+
+def test_p2_config_parses_and_has_expected_overrides():
+    from pathlib import Path
+
+    config_path = Path(__file__).resolve().parents[4] / 'configs' / 'auxdet' / \
+        'auxdet_r50_fpn_1x_voc_rahmoe_p2.py'
+    cfg = Config.fromfile(str(config_path))
+    neck = cfg.model.neck
+    assert neck.rahmoe_position == 'p2_bottleneck'
+    assert neck.rahmoe_level == 0
+    assert neck.rahmoe_bottleneck_dim == 64
+    assert neck.p2_residual_scale_init == 1.0
+    assert cfg.log_processor.num_digits == 8
+    assert cfg.load_from is None and cfg.resume is False
