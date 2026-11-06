@@ -14,6 +14,8 @@ from einops import rearrange
 from mmdet.models.utils import DMLPAttention, FCResLayer
 from mmdet.structures import DetDataSample
 from .rahmoe import RAHMoE
+from .target_heatmap import (TargetHeatmapHead, TargetHeatmapLoss,
+                             build_target_heatmaps)
 
 
 @MODELS.register_module()
@@ -63,6 +65,21 @@ class AuxFPN(BaseModule):
             ``p2_bottleneck`` position. Defaults to 64.
         p2_residual_scale_init (float): Initial value of the learnable P2
             residual scale in ``p2_bottleneck`` mode. Defaults to 1.0.
+        heatmap_enabled (bool): Master switch for target-center supervision
+            and gating on the compressed internal P2 feature. Defaults to
+            False; disabling it also disables heatmap gating.
+        heatmap_gate_enabled (bool): Modulate the P2 MoE residual by
+            ``0.5 + sigmoid(heatmap_logits)``. Requires P2 RAHMoE and heatmap
+            supervision. Defaults to False.
+        heatmap_hidden_channels (int): Compressed baseline feature and
+            heatmap head hidden channels. Defaults to 64.
+        heatmap_loss_weight (float): Auxiliary loss weight. Defaults to .05.
+        heatmap_alpha (float): Prediction focal exponent. Defaults to 2.
+        heatmap_gamma (float): Gaussian negative exponent. Defaults to 4.
+        heatmap_min_radius (int): Minimum feature-space radius. Defaults to 1.
+        heatmap_max_radius (int): Maximum feature-space radius. Defaults to 16.
+        heatmap_min_overlap (float): Gaussian radius IoU parameter. Defaults
+            to .7.
         init_cfg (:obj:`ConfigDict` or dict or list[:obj:`ConfigDict` or \
             dict]): Initialization config dict.
 
@@ -105,6 +122,15 @@ class AuxFPN(BaseModule):
             rahmoe_eval_bypass: bool = False,
             rahmoe_bottleneck_dim: int = 64,
             p2_residual_scale_init: float = 1.0,
+            heatmap_enabled: bool = False,
+            heatmap_gate_enabled: bool = False,
+            heatmap_hidden_channels: int = 64,
+            heatmap_loss_weight: float = 0.05,
+            heatmap_alpha: float = 2.0,
+            heatmap_gamma: float = 4.0,
+            heatmap_min_radius: int = 1,
+            heatmap_max_radius: int = 16,
+            heatmap_min_overlap: float = 0.7,
     ) -> None:
         super().__init__(init_cfg=init_cfg)
         assert isinstance(in_channels, list)
@@ -117,6 +143,29 @@ class AuxFPN(BaseModule):
         self.fp16_enabled = False
         self.upsample_cfg = upsample_cfg.copy()
         self.moe_aux_loss = None
+        self.heatmap_logits = None
+        self.heatmap_enabled = heatmap_enabled
+        self.heatmap_gate_enabled = heatmap_enabled and heatmap_gate_enabled
+        self.heatmap_min_radius = heatmap_min_radius
+        self.heatmap_max_radius = heatmap_max_radius
+        self.heatmap_min_overlap = heatmap_min_overlap
+
+        if self.heatmap_gate_enabled and not (
+                enable_rahmoe and rahmoe_position == 'p2_bottleneck'):
+            raise ValueError('Heatmap gating requires enabled P2 RAHMoE '
+                             'and heatmap supervision.')
+        if heatmap_enabled:
+            if start_level != 0 or heatmap_hidden_channels <= 0:
+                raise ValueError('Heatmap supervision requires P2 (start_level '
+                                 '=0) and positive hidden channels.')
+            if enable_rahmoe and rahmoe_position != 'p2_bottleneck':
+                raise ValueError('MoE heatmap supervision requires '
+                                 'rahmoe_position=p2_bottleneck.')
+            if not (isinstance(heatmap_min_radius, int)
+                    and isinstance(heatmap_max_radius, int)
+                    and 0 <= heatmap_min_radius <= heatmap_max_radius
+                    and 0 < heatmap_min_overlap < 1):
+                raise ValueError('Invalid heatmap Gaussian parameters.')
 
         self.enable_rahmoe = enable_rahmoe
         self.rahmoe_level = rahmoe_level
@@ -257,6 +306,32 @@ class AuxFPN(BaseModule):
                 rahmoe_cfg.pop('dim')
             self.rahmoe = RAHMoE(dim=rahmoe_dim, **rahmoe_cfg)
 
+        if self.heatmap_enabled:
+            if self.enable_rahmoe:
+                heatmap_in_channels = rahmoe_bottleneck_dim
+            else:
+                # Baseline control: same compression, auxiliary training only.
+                self.p2_down = nn.Conv2d(
+                    out_channels, heatmap_hidden_channels, kernel_size=1)
+                heatmap_in_channels = heatmap_hidden_channels
+            self.target_heatmap_head = TargetHeatmapHead(
+                heatmap_in_channels, heatmap_hidden_channels)
+            self.target_heatmap_loss = TargetHeatmapLoss(
+                heatmap_loss_weight, heatmap_alpha, heatmap_gamma)
+
+    def compute_target_heatmap_loss(self, batch_data_samples,
+                                    batch_input_shape):
+        """Consume this forward's logits before RPN/RoI can modify samples."""
+        logits = self.heatmap_logits
+        self.heatmap_logits = None
+        if not self.training or not self.heatmap_enabled or logits is None:
+            return None
+        targets, valid = build_target_heatmaps(
+            logits, batch_data_samples, batch_input_shape,
+            self.heatmap_min_radius, self.heatmap_max_radius,
+            self.heatmap_min_overlap)
+        return self.target_heatmap_loss(logits, targets, valid)
+
     def forward(self, inputs: Tuple[Tensor], meta_inf: List[DetDataSample]) -> Tuple[Tensor]:
         """Forward function.
 
@@ -270,6 +345,9 @@ class AuxFPN(BaseModule):
                 Shape: (Batch_size, Out_channels, H', W').
         """
         assert len(inputs) == len(self.in_channels)
+        # Replace temporary graph references even if the preceding forward
+        # was feature extraction without a detector loss call.
+        self.heatmap_logits = None
 
         # build laterals
         laterals = [
@@ -349,7 +427,25 @@ class AuxFPN(BaseModule):
             p2_reduced = self.p2_down(p2)
             p2_moe = self.rahmoe(p2_reduced)
             p2_delta = p2_moe - p2_reduced
-            laterals[0] = p2 + self.p2_res_scale * self.p2_up(p2_delta)
+            if self.heatmap_enabled and (
+                    self.training or self.heatmap_gate_enabled):
+                heatmap_logits = self.target_heatmap_head(p2_moe)
+                if self.training:
+                    self.heatmap_logits = heatmap_logits
+                if self.heatmap_gate_enabled:
+                    p2_delta_up = self.p2_up(p2_delta)
+                    gate = 0.5 + heatmap_logits.sigmoid()
+                    laterals[0] = (p2 + self.p2_res_scale * gate * p2_delta_up)
+                else:
+                    laterals[0] = p2 + self.p2_res_scale * self.p2_up(p2_delta)
+            else:
+                laterals[0] = p2 + self.p2_res_scale * self.p2_up(p2_delta)
+
+        if self.heatmap_enabled and not self.enable_rahmoe and self.training:
+            # The control's detection features are untouched; gradients from
+            # this training-only head flow back into the original P2 feature.
+            self.heatmap_logits = self.target_heatmap_head(
+                self.p2_down(laterals[0]))
 
         if (self.enable_rahmoe
                 and (self.training or not self.rahmoe_eval_bypass)):

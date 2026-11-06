@@ -176,6 +176,16 @@ class TwoStageDetector(BaseDetector):
 
         losses = dict()
 
+        # Consume only the current training forward's heatmap graph and GT.
+        # This happens before RPN creates/relabels its own sample copy.
+        neck = getattr(self, 'neck', None)
+        heatmap_loss_fn = getattr(neck, 'compute_target_heatmap_loss', None)
+        if self.training and callable(heatmap_loss_fn):
+            heatmap_loss = heatmap_loss_fn(
+                batch_data_samples, batch_inputs.shape[-2:])
+            if heatmap_loss is not None:
+                losses['loss_target_heatmap'] = heatmap_loss
+
         # RPN forward and loss
         if self.with_rpn:
             proposal_cfg = self.train_cfg.get('rpn_proposal',
