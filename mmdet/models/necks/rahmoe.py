@@ -163,12 +163,24 @@ class DenseResponseStateRouter(nn.Module):
     Constructs 6 explicit response-state cues (mean response, local contrast,
     multi-scale context, directional structure) and fuses them with a
     compressed feature descriptor to produce per-expert gates via Softmax.
+
+    AuxDet's optional metadata adaptation adds a LayerNorm/Linear/GELU/Linear
+    bias before the single softmax. Its final Linear starts at zero. Disabled
+    by default, it creates no extra parameters in the original visual router.
+    route_diagnostics only retains detached scalar/four-element statistics.
     """
     NUM_CUES = 6
 
-    def __init__(self, dim, num_experts=4, hidden=32, temperature=1.5):
+    def __init__(self, dim, num_experts=4, hidden=32, temperature=1.5,
+                 metadata_conditioned_router=False, meta_feature_dim=128,
+                 meta_router_hidden=32, meta_router_scale_init=1.0,
+                 route_diagnostics=False):
         super().__init__()
         self.num_experts = num_experts
+        self.metadata_conditioned_router = metadata_conditioned_router
+        self.meta_feature_dim = meta_feature_dim
+        self.route_diagnostics = route_diagnostics
+        self.route_stats = {}
 
         self.feat_reduce = nn.Sequential(
             nn.Conv2d(dim, hidden, 1, bias=False),
@@ -180,6 +192,21 @@ class DenseResponseStateRouter(nn.Module):
             nn.Conv2d(hidden, num_experts, 1, bias=True),
         )
         self.register_buffer("temperature", torch.tensor(float(temperature)))
+
+        if self.metadata_conditioned_router:
+            if meta_feature_dim <= 0 or meta_router_hidden <= 0:
+                raise ValueError('Metadata router dimensions must be positive.')
+            # AuxDet metadata-conditioning adaptation of PTBD-Net RAHMoE.
+            # The existing visual router and all experts remain unchanged.
+            self.metadata_mlp = nn.Sequential(
+                nn.LayerNorm(meta_feature_dim),
+                nn.Linear(meta_feature_dim, meta_router_hidden), nn.GELU(),
+                nn.Linear(meta_router_hidden, num_experts),
+            )
+            nn.init.zeros_(self.metadata_mlp[-1].weight)
+            nn.init.zeros_(self.metadata_mlp[-1].bias)
+            self.meta_scale = nn.Parameter(
+                torch.tensor(float(meta_router_scale_init)))
 
     @torch.no_grad()
     def set_temperature(self, value):
@@ -198,10 +225,44 @@ class DenseResponseStateRouter(nn.Module):
 
         return torch.cat([feat, r, c, s3, s5, s7, gh + gv], dim=1)
 
-    def forward(self, x):
+    def forward(self, x, meta_feature=None):
         prompt = self.build_cues(x)
-        logits = self.router(prompt)
+        visual_logits = self.router(prompt)
+        logits = visual_logits
+        meta_logits = None
+        if self.metadata_conditioned_router:
+            if (meta_feature is None or meta_feature.ndim != 2
+                    or meta_feature.shape != (x.shape[0], self.meta_feature_dim)):
+                raise ValueError('meta_feature must have shape '
+                                 '[B, meta_feature_dim] when metadata routing '
+                                 'is enabled.')
+            if meta_feature.device != x.device:
+                raise ValueError('meta_feature and visual features must share '
+                                 'the same device.')
+            meta_logits = self.metadata_mlp(meta_feature)
+            # Preserve the visual path's dtype under AMP and apply exactly
+            # one softmax to the combined logits. The cast preserves gradients.
+            meta_bias = (self.meta_scale * meta_logits).to(visual_logits.dtype)
+            logits = visual_logits + meta_bias[:, :, None, None]
         gates = torch.softmax(logits / self.temperature.clamp_min(0.3), dim=1)
+        self.route_stats = {}
+        if self.route_diagnostics:
+            with torch.no_grad():
+                visual = visual_logits.detach().float()
+                probs = gates.detach().float()
+                self.route_stats = {
+                    'visual_logits_mean': visual.mean(),
+                    'visual_logits_std': visual.std(unbiased=False),
+                    'expert_usage': probs.mean(dim=(0, 2, 3)),
+                    'entropy': -(probs * probs.clamp_min(1e-8).log()
+                                 ).sum(dim=1).mean(),
+                }
+                if meta_logits is not None:
+                    meta = meta_logits.detach().float()
+                    self.route_stats.update(
+                        meta_logits_mean=meta.mean(),
+                        meta_logits_std=meta.std(unbiased=False),
+                        meta_scale=self.meta_scale.detach().float().clone())
         return gates, logits
 
 
@@ -217,17 +278,25 @@ class RAHMoE(nn.Module):
 
     where π_e ∈ [0, 1]^{B×1×H×W} are per-pixel soft router weights
     (dense routing — all experts always participate).
+
+    meta_feature is required only with metadata_conditioned_router=True.
+    The optional AuxDet adaptation conditions router logits; experts and the
+    four original auxiliary loss formulas remain the PTBD-Net implementation.
     """
     def __init__(self, dim, num_experts=4, router_hidden=32, temperature=1.5,
                  gamma_shared_init=0.1, gamma_routed_init=0.1,
                  balance_weight=1e-3, diversity_weight=1e-4,
                  entropy_weight=1e-4, zloss_weight=1e-5,
-                 entropy_target=1.05, compute_aux_loss=True):
+                 entropy_target=1.05, compute_aux_loss=True,
+                 metadata_conditioned_router=False, meta_feature_dim=128,
+                 meta_router_hidden=32, meta_router_scale_init=1.0,
+                 route_diagnostics=False):
         super().__init__()
         if num_experts != 4:
             raise ValueError('RAHMoE currently requires num_experts=4.')
         self.num_experts = num_experts
         self.compute_aux_loss = compute_aux_loss
+        self.metadata_conditioned_router = metadata_conditioned_router
 
         self.shared = SharedDecoderExpert(dim)
         self.experts = nn.ModuleList([
@@ -239,6 +308,11 @@ class RAHMoE(nn.Module):
         self.router = DenseResponseStateRouter(
             dim=dim, num_experts=num_experts,
             hidden=router_hidden, temperature=temperature,
+            metadata_conditioned_router=metadata_conditioned_router,
+            meta_feature_dim=meta_feature_dim,
+            meta_router_hidden=meta_router_hidden,
+            meta_router_scale_init=meta_router_scale_init,
+            route_diagnostics=route_diagnostics,
         )
 
         self.out_proj = nn.Conv2d(dim, dim, 1, bias=False)
@@ -255,10 +329,13 @@ class RAHMoE(nn.Module):
         self.aux_loss_logs = {}
         self.route_logs = {}
 
-    def forward(self, x, return_vis=False):
+    def forward(self, x, return_vis=False, meta_feature=None):
         shared = self.shared(x)
 
-        gates, logits = self.router(x)                                  # [B, E, H, W]
+        if self.metadata_conditioned_router:
+            gates, logits = self.router(x, meta_feature=meta_feature)
+        else:
+            gates, logits = self.router(x)                              # [B, E, H, W]
         expert_outputs = [e(x) for e in self.experts]
         expert_stack = torch.stack(expert_outputs, dim=1)               # [B, E, C, H, W]
 
@@ -276,12 +353,9 @@ class RAHMoE(nn.Module):
             self.aux_loss = self._compute_aux(gates, logits, expert_stack)
         else:
             self.aux_loss = None
-        self.route_logs = {
-            "gates": gates.detach(),
-            "expert_norms": expert_stack.detach().pow(2).mean(dim=(2, 3, 4)).sqrt(),
-            "gamma_shared": self.gamma_shared.detach(),
-            "gamma_routed": self.gamma_routed.detach(),
-        }
+        # Opt-in compact detached statistics; never cache full-resolution
+        # gates on the module. return_vis still exposes them explicitly.
+        self.route_logs = dict(self.router.route_stats)
 
         if not return_vis:
             return out

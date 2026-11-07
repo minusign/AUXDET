@@ -305,6 +305,13 @@ class AuxFPN(BaseModule):
                         'feature dimension.')
                 rahmoe_cfg.pop('dim')
             self.rahmoe = RAHMoE(dim=rahmoe_dim, **rahmoe_cfg)
+            if self.rahmoe.metadata_conditioned_router:
+                if self.rahmoe_position != 'p2_bottleneck':
+                    raise ValueError('Metadata conditioning requires '
+                                     'rahmoe_position=p2_bottleneck.')
+                if self.rahmoe.router.meta_feature_dim != out_channels // 2:
+                    raise ValueError('meta_feature_dim must equal '
+                                     'AuxFPN out_channels // 2.')
 
         if self.heatmap_enabled:
             if self.enable_rahmoe:
@@ -356,6 +363,7 @@ class AuxFPN(BaseModule):
         ]
 
         alphas = []
+        p2_aux_feature = None
         for idx in range(2):
             # step 1. 获取补偿特征并降维
             sem_comp_fea = self.downsamples[idx](laterals[idx]) - laterals[-1]
@@ -363,6 +371,10 @@ class AuxFPN(BaseModule):
             # step 2. 融合 元数据特征及补偿特征，得到最终辅助特征
             all_aux_fea = self.meta_process_with_sem(
                 meta_inf, inputs[0].dtype, inputs[0].device, sem_inf)
+            if idx == 0:
+                # P2's metadata + level-specific semantic compensation;
+                # keep the original graph locally, never the idx=1 result.
+                p2_aux_feature = all_aux_fea
 
             # 为当前层计算 ALPHA 并保存，用于自适应调整后续边缘特征增强
             current_alpha = self.mlp(all_aux_fea).view(-1, 1, 1, 1)
@@ -425,7 +437,11 @@ class AuxFPN(BaseModule):
                 and self.rahmoe_position == 'p2_bottleneck'):
             p2 = laterals[0]
             p2_reduced = self.p2_down(p2)
-            p2_moe = self.rahmoe(p2_reduced)
+            if self.rahmoe.metadata_conditioned_router:
+                p2_moe = self.rahmoe(
+                    p2_reduced, meta_feature=p2_aux_feature)
+            else:
+                p2_moe = self.rahmoe(p2_reduced)
             p2_delta = p2_moe - p2_reduced
             if self.heatmap_enabled and (
                     self.training or self.heatmap_gate_enabled):
