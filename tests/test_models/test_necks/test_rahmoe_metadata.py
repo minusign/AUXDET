@@ -20,6 +20,11 @@ def _router(**kwargs):
         dim=8, metadata_conditioned_router=True, **kwargs)
 
 
+def _film_router(**kwargs):
+    return DenseResponseStateRouter(
+        dim=8, metadata_conditioning_type='film', **kwargs)
+
+
 def _neck(enabled=True, **kwargs):
     cfg = dict(
         in_channels=[8] * 4, out_channels=8, num_outs=4,
@@ -118,6 +123,42 @@ def test_metadata_gradient_after_two_optimizer_steps():
         optimizer.step()
 
 
+def test_film_router_is_identity_at_zero_initialization_and_shapes():
+    visual = DenseResponseStateRouter(dim=8).eval()
+    film = _film_router().eval()
+    film.load_state_dict(visual.state_dict(), strict=False)
+    x = torch.randn(2, 8, 6, 8)
+    meta = torch.randn(2, 128)
+    visual_gates, visual_logits = visual(x)
+    film_gates, film_logits = film(x, meta)
+    assert film.film_mlp[-1].weight.count_nonzero() == 0
+    assert film.film_mlp[-1].bias.count_nonzero() == 0
+    assert film_logits.shape == film_gates.shape == (2, 4, 6, 8)
+    torch.testing.assert_close(film_logits, visual_logits, rtol=0, atol=0)
+    torch.testing.assert_close(film_gates, visual_gates, rtol=0, atol=0)
+    torch.testing.assert_close(film_gates.sum(1), torch.ones(2, 6, 8))
+
+
+def test_film_router_metadata_and_front_layers_get_gradients_after_updates():
+    router = _film_router()
+    x = torch.randn(2, 8, 6, 8)
+    meta = torch.randn(2, 128, requires_grad=True)
+    optimizer = torch.optim.SGD(router.parameters(), lr=.1)
+    for step in range(2):
+        optimizer.zero_grad(set_to_none=True)
+        meta.grad = None
+        gates, _ = router(x, meta)
+        loss = -gates[:, 0].clamp_min(1e-8).log().mean()
+        loss.backward()
+        assert router.film_mlp[-1].weight.grad is not None
+        assert torch.isfinite(router.film_mlp[-1].weight.grad).all()
+        if step == 1:
+            assert meta.grad is not None and meta.grad.abs().sum() > 0
+            assert router.film_mlp[1].weight.grad.abs().sum() > 0
+            assert router.film_mlp[0].weight.grad.abs().sum() > 0
+        optimizer.step()
+
+
 def test_missing_or_invalid_metadata_rejected_only_when_enabled():
     router = _router()
     x = torch.randn(2, 8, 6, 8)
@@ -160,6 +201,22 @@ def test_moe_experts_once_and_aux_receives_joint_logits():
                    for p in module.parameters())
     assert meta.grad.abs().sum() > 0
     assert moe.route_logs == {}
+
+
+def test_film_rahmoe_aux_loss_and_experts_receive_gradients():
+    moe = RAHMoE(dim=8, metadata_conditioning_type='film')
+    x = torch.randn(2, 8, 6, 8, requires_grad=True)
+    meta = torch.randn(2, 128, requires_grad=True)
+    out = moe(x, meta_feature=meta)
+    assert moe.aux_loss is not None and moe.aux_loss.grad_fn is not None
+    total = out.square().mean() + moe.aux_loss
+    total.backward()
+    assert any(p.grad is not None for p in moe.router.parameters())
+    assert all(p.grad is not None and torch.isfinite(p.grad).all()
+               for p in moe.router.film_mlp.parameters())
+    assert all(p.grad is not None and torch.isfinite(p.grad).all()
+               for p in moe.experts.parameters())
+    assert meta.grad is not None and torch.isfinite(meta.grad).all()
 
 
 def test_rahmoe_zero_metadata_matches_existing_output_and_aux():
@@ -218,6 +275,7 @@ def test_diagnostics_are_opt_in_detached_small_statistics():
     moe(torch.randn(2, 8, 6, 8), meta_feature=torch.randn(2, 128))
     logs = moe.route_logs
     assert set(logs) == {'visual_logits_mean', 'visual_logits_std',
+                         'visual_hidden_mean', 'visual_hidden_std',
                          'meta_logits_mean', 'meta_logits_std', 'meta_scale',
                          'expert_usage', 'entropy'}
     assert logs['expert_usage'].shape == (4,)
@@ -256,8 +314,15 @@ def test_configs_and_old_heatmap_modes_build():
         config_dir / 'auxdet_r50_fpn_1x_voc_rahmoe_p2.py'))
     new = Config.fromfile(str(
         config_dir / 'auxdet_r50_fpn_1x_voc_rahmoe_p2_meta.py'))
+    film = Config.fromfile(str(
+        config_dir / 'auxdet_r50_fpn_1x_voc_rahmoe_p2_film.py'))
     assert not new.model.neck.heatmap_enabled
     assert new.model.neck.rahmoe_cfg.metadata_conditioned_router
+    assert film.model.neck.rahmoe_cfg.metadata_conditioning_type == 'film'
+    assert film.model.neck.rahmoe_cfg.film_strength == 0.5
+    assert film.model.neck.heatmap_enabled is False
+    assert film.randomness.seed == 42
+    assert film.param_scheduler[1].milestones == [8, 11]
     assert new.train_cfg.max_epochs == 12 and new.train_cfg.val_interval == 1
     assert new.param_scheduler[1].end == 12
     assert new.param_scheduler[1].milestones == [8, 11]
@@ -269,6 +334,9 @@ def test_configs_and_old_heatmap_modes_build():
     neck = MODELS.build(new.model.neck)
     neck.init_weights()
     assert neck.rahmoe.router.metadata_mlp[-1].weight.count_nonzero() == 0
+    film_neck = MODELS.build(film.model.neck)
+    assert film_neck.rahmoe.metadata_conditioning_type == 'film'
+    assert film_neck.rahmoe.router.film_mlp[-1].weight.count_nonzero() == 0
     for filename in (
         'auxdet_r50_fpn_1x_voc.py', 'auxdet_r50_fpn_1x_voc_rahmoe_p2.py',
         'auxdet_r50_fpn_1x_voc_rahmoe_aux_midfpn.py',

@@ -34,6 +34,36 @@ def grad_stats(name, params):
     print(f'{name}: grads={len(grads)}/{len(params)}, L2={norm:.8e}')
 
 
+def sample_view(sample):
+    """Read the platform label from either DetDataSample or a test stub."""
+    metainfo = getattr(sample, 'metainfo', None)
+    if metainfo is not None:
+        if hasattr(metainfo, 'get'):
+            return metainfo.get('view')
+        return getattr(metainfo, 'view', None)
+    return getattr(sample, 'view', None)
+
+
+def grouped_router_stats(router, visual, meta, samples):
+    """Run only the Router on a fixed visual tensor and group by platform."""
+    groups = {name: [] for name in ('Air', 'Land', 'Space')}
+    for index, sample in enumerate(samples):
+        view = sample_view(sample)
+        if view in groups:
+            groups[view].append(index)
+    for name, indices in groups.items():
+        if not indices:
+            print(f'group {name}: no samples in this batch')
+            continue
+        group_meta = meta[indices].float()
+        print_stats(f'group {name} p2_aux_feature', {
+            'mean': group_meta.mean(),
+            'std': group_meta.std(unbiased=False),
+        })
+        router(visual[indices], meta[indices])
+        print_stats(f'group {name} routing', router.route_stats)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', default=(
@@ -61,10 +91,16 @@ def main():
         cfg.merge_from_dict(args.cfg_options)
     model = MODELS.build(cfg.model)
     moe = model.neck.rahmoe
-    if not moe.metadata_conditioned_router or model.neck.heatmap_enabled:
-        raise ValueError('Use MC-RAHMoE with heatmap disabled')
-    initial_scale = cfg.model.neck.rahmoe_cfg.get('meta_router_scale_init', 1.)
-    print(f'configured meta_scale init={initial_scale:.8e}')
+    conditioning_type = moe.metadata_conditioning_type
+    if conditioning_type == 'visual' or model.neck.heatmap_enabled:
+        raise ValueError('Use metadata-conditioned RAH-MoE with heatmap disabled')
+    if conditioning_type == 'logit_bias':
+        initial_scale = cfg.model.neck.rahmoe_cfg.get(
+            'meta_router_scale_init', 1.)
+        print(f'configured meta_scale init={initial_scale:.8e}')
+    else:
+        film_strength = cfg.model.neck.rahmoe_cfg.get('film_strength', 0.5)
+        print(f'configured film_strength={film_strength:.8e}')
     if args.checkpoint:
         load_checkpoint(model, args.checkpoint,
                         map_location='cpu', strict=True)
@@ -72,7 +108,8 @@ def main():
         model.init_weights()
     model.to(args.device).train(args.check_backward)
     moe.router.route_diagnostics = True
-    print(f'current meta_scale={moe.router.meta_scale.item():.8e}')
+    if conditioning_type == 'logit_bias':
+        print(f'current meta_scale={moe.router.meta_scale.item():.8e}')
 
     loader_cfg = copy.deepcopy(cfg.train_dataloader if args.check_backward
                                else cfg.val_dataloader)
@@ -118,32 +155,40 @@ def main():
             raise RuntimeError('Nonfinite total loss')
         total.backward()
         print(f'total={total.item():.8e}, loss_rahmoe_aux={aux.item():.8e}')
-        grad_stats('metadata_mlp', moe.router.metadata_mlp.parameters())
-        grad_stats('meta_scale', [moe.router.meta_scale])
+        if conditioning_type == 'logit_bias':
+            grad_stats('metadata_mlp', moe.router.metadata_mlp.parameters())
+            grad_stats('meta_scale', [moe.router.meta_scale])
+        else:
+            grad_stats('film_mlp', moe.router.film_mlp.parameters())
         grad_stats('p2_down', model.neck.p2_down.parameters())
         grad_stats('p2_up', model.neck.p2_up.parameters())
         for index, expert in enumerate(moe.experts):
             grad_stats(f'expert_{index}', expert.parameters())
-        if meta.grad is None or not torch.isfinite(meta.grad).all():
-            raise RuntimeError('P2 auxiliary feature gradient is invalid')
-        print(f'p2_aux_feature grad L2={meta.grad.float().norm().item():.8e}')
-        print('No optimizer update. At zero init the MLP front layers and '
-              'meta_scale can have zero gradients; two-step unit tests cover '
-              'their later gradients.')
+        if meta.grad is None:
+            print('p2_aux_feature grad: none (expected at zero-init FiLM '
+                  'before its first optimizer update)')
+        elif not torch.isfinite(meta.grad).all():
+            raise RuntimeError('P2 auxiliary feature gradient is nonfinite')
+        else:
+            print(f'p2_aux_feature grad L2={meta.grad.float().norm().item():.8e}')
+        print('No optimizer update. FiLM input gradients can be zero on the '
+              'first step because its final layer is zero-initialized.')
 
     # Diagnostic-only counterfactuals; all keep the same visual input and
     # never execute M2DM, experts or heads again. No parameters change.
     router = moe.router
     x, meta = captured['x'].detach(), meta.detach()
+    samples = data['data_samples']
     with torch.no_grad(), torch.autocast(
             device_type=torch.device(args.device).type,
             dtype=torch.float16, enabled=args.amp):
         normal, _ = router(x, meta)
-        router.metadata_conditioned_router = False
+        original_type = router.metadata_conditioning_type
+        router.metadata_conditioning_type = 'visual'
         try:
             visual_only, _ = router(x)
         finally:
-            router.metadata_conditioned_router = True
+            router.metadata_conditioning_type = original_type
         effect = (normal.float() - visual_only.float()).abs()
         print('metadata vs visual-only gates: '
               f'mean_abs={effect.mean().item():.8e}, '
@@ -158,6 +203,8 @@ def main():
                   'features is expected, not proof of a broken branch.')
         else:
             print('Swap requires B>=2; skipped for this batch.')
+        print('fixed-visual platform groups (Router only):')
+        grouped_router_stats(router, x, meta, samples)
     captured.clear()
 
 

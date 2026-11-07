@@ -164,21 +164,30 @@ class DenseResponseStateRouter(nn.Module):
     multi-scale context, directional structure) and fuses them with a
     compressed feature descriptor to produce per-expert gates via Softmax.
 
-    AuxDet's optional metadata adaptation adds a LayerNorm/Linear/GELU/Linear
-    bias before the single softmax. Its final Linear starts at zero. Disabled
-    by default, it creates no extra parameters in the original visual router.
-    route_diagnostics only retains detached scalar/four-element statistics.
+    AuxDet's optional metadata adaptation supports a logit-bias mode and a
+    FiLM mode. Both use one final visual-router logits layer and one softmax;
+    disabled mode creates no extra parameters. route_diagnostics only retains
+    detached scalar/four-element statistics.
     """
     NUM_CUES = 6
 
     def __init__(self, dim, num_experts=4, hidden=32, temperature=1.5,
                  metadata_conditioned_router=False, meta_feature_dim=128,
                  meta_router_hidden=32, meta_router_scale_init=1.0,
-                 route_diagnostics=False):
+                 metadata_conditioning_type=None, film_strength=0.5,
+                 film_hidden=64, route_diagnostics=False):
         super().__init__()
         self.num_experts = num_experts
-        self.metadata_conditioned_router = metadata_conditioned_router
+        if metadata_conditioning_type is None:
+            metadata_conditioning_type = (
+                'logit_bias' if metadata_conditioned_router else 'visual')
+        if metadata_conditioning_type not in ('visual', 'logit_bias', 'film'):
+            raise ValueError('metadata_conditioning_type must be visual, '
+                             'logit_bias, or film.')
+        self.metadata_conditioning_type = metadata_conditioning_type
+        self.metadata_conditioned_router = metadata_conditioning_type != 'visual'
         self.meta_feature_dim = meta_feature_dim
+        self.film_strength = float(film_strength)
         self.route_diagnostics = route_diagnostics
         self.route_stats = {}
 
@@ -193,7 +202,7 @@ class DenseResponseStateRouter(nn.Module):
         )
         self.register_buffer("temperature", torch.tensor(float(temperature)))
 
-        if self.metadata_conditioned_router:
+        if self.metadata_conditioning_type == 'logit_bias':
             if meta_feature_dim <= 0 or meta_router_hidden <= 0:
                 raise ValueError('Metadata router dimensions must be positive.')
             # AuxDet metadata-conditioning adaptation of PTBD-Net RAHMoE.
@@ -207,6 +216,18 @@ class DenseResponseStateRouter(nn.Module):
             nn.init.zeros_(self.metadata_mlp[-1].bias)
             self.meta_scale = nn.Parameter(
                 torch.tensor(float(meta_router_scale_init)))
+        elif self.metadata_conditioning_type == 'film':
+            if meta_feature_dim <= 0 or film_hidden <= 0:
+                raise ValueError('FiLM dimensions must be positive.')
+            # The visual hidden tensor is the output of router[0:3] and has
+            # exactly ``hidden`` channels. The last layer remains router[3].
+            self.film_mlp = nn.Sequential(
+                nn.LayerNorm(meta_feature_dim),
+                nn.Linear(meta_feature_dim, film_hidden), nn.GELU(),
+                nn.Linear(film_hidden, hidden * 2),
+            )
+            nn.init.zeros_(self.film_mlp[-1].weight)
+            nn.init.zeros_(self.film_mlp[-1].bias)
 
     @torch.no_grad()
     def set_temperature(self, value):
@@ -227,19 +248,27 @@ class DenseResponseStateRouter(nn.Module):
 
     def forward(self, x, meta_feature=None):
         prompt = self.build_cues(x)
-        visual_logits = self.router(prompt)
+        # Keep the existing Sequential module and state keys. h is the actual
+        # hidden feature immediately before the original logits convolution.
+        h = self.router[0](prompt)
+        h = self.router[1](h)
+        h = self.router[2](h)
+        visual_hidden = h
+        meta_output = None
+        if self.metadata_conditioning_type == 'film':
+            meta_output = self._validate_meta(x, meta_feature)
+            film_params = self.film_mlp(meta_output)
+            gamma, beta = film_params.chunk(2, dim=1)
+            gamma = gamma.to(h.dtype)[:, :, None, None]
+            beta = beta.to(h.dtype)[:, :, None, None]
+            h = (h * (1.0 + self.film_strength * gamma.tanh())
+                 + self.film_strength * beta.tanh())
+        visual_logits = self.router[3](h)
         logits = visual_logits
         meta_logits = None
-        if self.metadata_conditioned_router:
-            if (meta_feature is None or meta_feature.ndim != 2
-                    or meta_feature.shape != (x.shape[0], self.meta_feature_dim)):
-                raise ValueError('meta_feature must have shape '
-                                 '[B, meta_feature_dim] when metadata routing '
-                                 'is enabled.')
-            if meta_feature.device != x.device:
-                raise ValueError('meta_feature and visual features must share '
-                                 'the same device.')
-            meta_logits = self.metadata_mlp(meta_feature)
+        if self.metadata_conditioning_type == 'logit_bias':
+            meta_output = self._validate_meta(x, meta_feature)
+            meta_logits = self.metadata_mlp(meta_output)
             # Preserve the visual path's dtype under AMP and apply exactly
             # one softmax to the combined logits. The cast preserves gradients.
             meta_bias = (self.meta_scale * meta_logits).to(visual_logits.dtype)
@@ -253,17 +282,43 @@ class DenseResponseStateRouter(nn.Module):
                 self.route_stats = {
                     'visual_logits_mean': visual.mean(),
                     'visual_logits_std': visual.std(unbiased=False),
+                    # Keep this statistic on the unconditioned output of
+                    # router[0:3], so it is comparable across router modes.
+                    'visual_hidden_mean': visual_hidden.detach().float().mean(),
+                    'visual_hidden_std': visual_hidden.detach().float().std(unbiased=False),
                     'expert_usage': probs.mean(dim=(0, 2, 3)),
                     'entropy': -(probs * probs.clamp_min(1e-8).log()
                                  ).sum(dim=1).mean(),
                 }
                 if meta_logits is not None:
                     meta = meta_logits.detach().float()
+                    centered = meta - meta.mean(dim=1, keepdim=True)
                     self.route_stats.update(
                         meta_logits_mean=meta.mean(),
                         meta_logits_std=meta.std(unbiased=False),
+                        meta_logits_centered_std=centered.std(unbiased=False),
                         meta_scale=self.meta_scale.detach().float().clone())
+                elif self.metadata_conditioning_type == 'film':
+                    params = self.film_mlp(meta_output).detach().float()
+                    gamma, beta = params.chunk(2, dim=1)
+                    self.route_stats.update(
+                        film_gamma_mean=gamma.mean(),
+                        film_gamma_std=gamma.std(unbiased=False),
+                        film_beta_mean=beta.mean(),
+                        film_beta_std=beta.std(unbiased=False),
+                        film_strength=visual_hidden.new_tensor(self.film_strength))
         return gates, logits
+
+    def _validate_meta(self, x, meta_feature):
+        if (meta_feature is None or meta_feature.ndim != 2
+                or meta_feature.shape != (x.shape[0], self.meta_feature_dim)):
+            raise ValueError('meta_feature must have shape '
+                             '[B, meta_feature_dim] when metadata routing '
+                             'is enabled.')
+        if meta_feature.device != x.device:
+            raise ValueError('meta_feature and visual features must share '
+                             'the same device.')
+        return meta_feature
 
 
 # ---------------------------------------------------------------------------
@@ -279,9 +334,10 @@ class RAHMoE(nn.Module):
     where π_e ∈ [0, 1]^{B×1×H×W} are per-pixel soft router weights
     (dense routing — all experts always participate).
 
-    meta_feature is required only with metadata_conditioned_router=True.
-    The optional AuxDet adaptation conditions router logits; experts and the
-    four original auxiliary loss formulas remain the PTBD-Net implementation.
+    meta_feature is required for the ``logit_bias`` and ``film`` router
+    modes. The optional AuxDet adaptation conditions only the router; experts
+    and the four original auxiliary loss formulas remain the PTBD-Net
+    implementation.
     """
     def __init__(self, dim, num_experts=4, router_hidden=32, temperature=1.5,
                  gamma_shared_init=0.1, gamma_routed_init=0.1,
@@ -290,13 +346,22 @@ class RAHMoE(nn.Module):
                  entropy_target=1.05, compute_aux_loss=True,
                  metadata_conditioned_router=False, meta_feature_dim=128,
                  meta_router_hidden=32, meta_router_scale_init=1.0,
+                 metadata_conditioning_type=None, film_strength=0.5,
+                 film_hidden=64,
                  route_diagnostics=False):
         super().__init__()
         if num_experts != 4:
             raise ValueError('RAHMoE currently requires num_experts=4.')
         self.num_experts = num_experts
         self.compute_aux_loss = compute_aux_loss
-        self.metadata_conditioned_router = metadata_conditioned_router
+        if metadata_conditioning_type is None:
+            metadata_conditioning_type = (
+                'logit_bias' if metadata_conditioned_router else 'visual')
+        if metadata_conditioning_type not in ('visual', 'logit_bias', 'film'):
+            raise ValueError('metadata_conditioning_type must be visual, '
+                             'logit_bias, or film.')
+        self.metadata_conditioning_type = metadata_conditioning_type
+        self.metadata_conditioned_router = metadata_conditioning_type != 'visual'
 
         self.shared = SharedDecoderExpert(dim)
         self.experts = nn.ModuleList([
@@ -312,6 +377,9 @@ class RAHMoE(nn.Module):
             meta_feature_dim=meta_feature_dim,
             meta_router_hidden=meta_router_hidden,
             meta_router_scale_init=meta_router_scale_init,
+            metadata_conditioning_type=metadata_conditioning_type,
+            film_strength=film_strength,
+            film_hidden=film_hidden,
             route_diagnostics=route_diagnostics,
         )
 
@@ -332,7 +400,7 @@ class RAHMoE(nn.Module):
     def forward(self, x, return_vis=False, meta_feature=None):
         shared = self.shared(x)
 
-        if self.metadata_conditioned_router:
+        if self.metadata_conditioning_type != 'visual':
             gates, logits = self.router(x, meta_feature=meta_feature)
         else:
             gates, logits = self.router(x)                              # [B, E, H, W]

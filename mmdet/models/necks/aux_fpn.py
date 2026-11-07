@@ -305,7 +305,7 @@ class AuxFPN(BaseModule):
                         'feature dimension.')
                 rahmoe_cfg.pop('dim')
             self.rahmoe = RAHMoE(dim=rahmoe_dim, **rahmoe_cfg)
-            if self.rahmoe.metadata_conditioned_router:
+            if self.rahmoe.metadata_conditioning_type != 'visual':
                 if self.rahmoe_position != 'p2_bottleneck':
                     raise ValueError('Metadata conditioning requires '
                                      'rahmoe_position=p2_bottleneck.')
@@ -437,7 +437,7 @@ class AuxFPN(BaseModule):
                 and self.rahmoe_position == 'p2_bottleneck'):
             p2 = laterals[0]
             p2_reduced = self.p2_down(p2)
-            if self.rahmoe.metadata_conditioned_router:
+            if self.rahmoe.metadata_conditioning_type != 'visual':
                 p2_moe = self.rahmoe(
                     p2_reduced, meta_feature=p2_aux_feature)
             else:
