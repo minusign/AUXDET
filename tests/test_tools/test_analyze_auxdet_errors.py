@@ -1,7 +1,9 @@
 """Synthetic tests for the standalone AuxDet error attribution logic."""
 import numpy as np
 
-from tools.analysis_tools.analyze_auxdet_errors import iou_matrix, match_image
+from tools.analysis_tools.analyze_auxdet_errors import (
+    iou_matrix, match_image, proposal_boxes_original, rpn_to_roi_rows,
+    threshold_summary)
 
 
 def gt(box, label=0, ignore=False):
@@ -71,3 +73,46 @@ def test_scaled_gt_is_converted_before_matching():
     converted = gt(resized_box / 2)
     result = match_image([converted], [pred((10, 10, 19, 19))])
     assert result['tp'] == 1 and result['fn'] == 0
+
+
+def test_rpn_scale_direction_and_final_regression_attribution():
+    # RPN is in 2x resized coordinates; the audit converts a copy back to XML
+    # coordinates before comparing it with GT.
+    proposal = {'bboxes': np.asarray([[20, 20, 40, 40]], dtype=np.float32)}
+    restored = proposal_boxes_original(
+        proposal, {'scale_factor': np.asarray([2, 2, 2, 2], dtype=np.float32)})
+    np.testing.assert_allclose(restored, [[10, 10, 20, 20]])
+
+    truth = [gt((10, 10, 20, 20))]
+    # Proposal IoU is exactly 1 here, while the final regression is a TP.
+    result = match_image(truth, [pred((10, 10, 20, 20))])
+    rows = rpn_to_roi_rows(truth,
+                           [dict(bbox=restored[0], score=.9)], result,
+                           'img-1')
+    assert rows[0]['rpn_hit_05'] and rows[0]['final_hit_05']
+    assert rows[0]['category'] == 'A_rpn05_final_tp'
+
+
+def test_rpn_low_iou_can_become_final_tp_and_high_iou_can_miss():
+    truth = [gt((0, 0, 9, 9)), gt((30, 30, 39, 39))]
+    # First proposal is disjoint (<.3), but the final box is a TP (category C).
+    # Second proposal is a good RPN box, while its final prediction misses (D).
+    proposals = [dict(bbox=np.asarray([[50, 50, 59, 59]], dtype=np.float32)[0], score=.9),
+                 dict(bbox=np.asarray([[30, 30, 39, 39]], dtype=np.float32)[0], score=.8)]
+    result = match_image(truth, [pred((0, 0, 9, 9), index=0)])
+    rows = rpn_to_roi_rows(truth, proposals, result, 'img-2')
+    assert rows[0]['category'] == 'C_rpn_lt03_final_tp'
+    assert rows[1]['category'] == 'D_rpn05_final_miss'
+
+
+def test_score_threshold_summary_reuses_predictions_without_new_nms():
+    truth = [gt((0, 0, 9, 9))]
+    image = dict(gt=truth,
+                 raw_predictions=[pred((0, 0, 9, 9), score=.8, index=0),
+                                  pred((80, 80, 89, 89), score=.2, index=1)],
+                 predictions=[], score_thr=.001)
+    low = threshold_summary([image], .1)
+    high = threshold_summary([image], .75)
+    assert low['tp'] == high['tp'] == 1
+    assert low['background_fp'] == 1 and high['background_fp'] == 0
+    assert low['recall'] == high['recall'] == 1.0

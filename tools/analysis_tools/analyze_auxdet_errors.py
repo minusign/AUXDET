@@ -1,8 +1,9 @@
 """Attribute AuxDet detection errors without changing model or evaluator.
 
 The script runs the configured detector on one validation split and writes
-per-image, per-GT, per-domain, size, proposal-recall, and visualization
-artifacts.  Predictions are requested with ``rescale=True``. GT boxes are
+per-image, per-GT, per-domain, size, proposal-recall, RPN-to-RoI attribution,
+score-threshold, coordinate-audit, and visualization artifacts.  Predictions
+are requested with ``rescale=True``. GT boxes are
 mapped back with ``scale_factor`` only when the configured pipeline loaded
 annotations before resizing; AuxDet's actual validation pipeline loads them
 after resize, so those XML-coordinate GT boxes remain unchanged. IoU uses the
@@ -136,14 +137,15 @@ def _gt_arrays(data_sample: Any, edges: Sequence[float],
     return records
 
 
-def _prediction_records(data_sample: Any, score_thr: float) -> List[dict]:
+def _prediction_records(data_sample: Any,
+                        score_thr: Optional[float] = None) -> List[dict]:
     pred = getattr(data_sample, 'pred_instances', None)
     boxes = _as_numpy(_get_field(pred, 'bboxes'), (-1, 4))
     scores = _as_numpy(_get_field(pred, 'scores'), (-1,)).astype(np.float32)
     labels = _as_numpy(_get_field(pred, 'labels'), (-1,)).astype(np.int64)
     records = []
     for index, (box, score, label) in enumerate(zip(boxes, scores, labels)):
-        if float(score) < score_thr:
+        if score_thr is not None and float(score) < score_thr:
             continue
         records.append(dict(index=index, bbox=box.astype(np.float32),
                             score=float(score), label=int(label)))
@@ -271,7 +273,7 @@ def _voc_ap(scores: Sequence[float], tp: Sequence[int], num_gt: int) -> Optional
 
 def ap50_subset(image_records: Sequence[dict], group: Optional[str] = None,
                 domain_type: Optional[str] = None,
-                domain_value: Optional[str] = None) -> float:
+                domain_value: Optional[str] = None) -> Optional[float]:
     """Compute an explicitly labelled area-under-PR AP50 subset metric."""
     scores, tp = [], []
     num_gt = 0
@@ -322,15 +324,109 @@ def proposal_recall_rows(proposals: Sequence[dict], gt: Sequence[dict],
     return rows
 
 
+def scale_factor_array(sample_or_meta: Any) -> np.ndarray:
+    """Return MMDetection's xyxy scale factor as four finite values.
+
+    ``scale_factor`` maps original image coordinates to the resized model
+    input.  The inverse operation used by :func:`proposal_boxes_original`
+    therefore divides by this array.  A missing or malformed value is treated
+    as an identity transform so that the audit remains explicit rather than
+    silently applying a partial scale.
+    """
+    meta = (sample_or_meta if isinstance(sample_or_meta, dict)
+            else _metainfo(sample_or_meta))
+    value = np.asarray(meta.get('scale_factor', 1), dtype=np.float32).reshape(-1)
+    if value.size == 1:
+        value = np.repeat(value, 4)
+    if value.size != 4 or not np.all(np.isfinite(value)) or np.any(value == 0):
+        return np.ones(4, dtype=np.float32)
+    return value
+
+
+def proposal_boxes_original(proposal: Any, sample_or_meta: Any) -> np.ndarray:
+    """Copy RPN boxes from resized/input coordinates to original coordinates."""
+    boxes = _as_numpy(_get_field(proposal, 'bboxes'), (-1, 4)).astype(np.float32)
+    return boxes / scale_factor_array(sample_or_meta)[None, :]
+
+
+def rpn_to_roi_rows(gt: Sequence[dict], proposals: Sequence[dict],
+                    final_result: dict, image_id: str,
+                    view: str = 'Unknown', band_type: str = 'Unknown') -> List[dict]:
+    """Join original-coordinate RPN IoU with the actual one-to-one TP result.
+
+    ``best_final_iou`` is diagnostic (the best final box for the GT), while
+    ``final_hit_05`` is deliberately taken from ``match_image``'s matched
+    status.  This prevents a second, many-to-one IoU test from overstating
+    final recall when several predictions compete for one GT.
+    """
+    normal = [g for g in gt if not g.get('ignore', False)]
+    proposal_boxes = np.asarray([p['bbox'] for p in proposals], dtype=np.float32).reshape(-1, 4)
+    proposal_ious = iou_matrix([g['bbox'] for g in normal], proposal_boxes)
+    final_gt_rows = list(final_result.get('gts', []))
+    rows = []
+    for gi, record in enumerate(normal):
+        best_rpn = (float(proposal_ious[gi].max())
+                    if proposal_ious.shape[1] else 0.0)
+        final_row = final_gt_rows[gi] if gi < len(final_gt_rows) else {}
+        best_final = float(final_row.get('best_iou', 0.0))
+        final_hit = final_row.get('status') == 'matched'
+        if best_rpn >= 0.5 and final_hit:
+            category = 'A_rpn05_final_tp'
+        elif 0.3 <= best_rpn < 0.5 and final_hit:
+            category = 'B_rpn03_05_final_tp'
+        elif best_rpn < 0.3 and final_hit:
+            category = 'C_rpn_lt03_final_tp'
+        elif best_rpn >= 0.5 and not final_hit:
+            category = 'D_rpn05_final_miss'
+        elif best_rpn < 0.3 and not final_hit:
+            category = 'E_rpn_lt03_final_miss'
+        else:
+            # [0.3, 0.5) misses are outside the requested A-E bins; retain
+            # them explicitly instead of silently folding them into E.
+            category = 'F_rpn03_05_final_miss'
+        rows.append(dict(image_id=image_id, gt_index=record.get('index', gi),
+                         gt_bbox=' '.join(f'{float(x):.4f}' for x in record['bbox']),
+                         gt_area=float(record['area']), best_rpn_iou=best_rpn,
+                         best_final_iou=best_final,
+                         rpn_hit_03=int(best_rpn >= 0.3),
+                         rpn_hit_05=int(best_rpn >= 0.5),
+                         final_hit_05=int(final_hit), category=category,
+                         size_group=record.get('size_group', 'unknown'),
+                         view=view, band_type=band_type))
+    return rows
+
+
+def threshold_summary(image_records: Sequence[dict], threshold: float) -> dict:
+    """Re-score unchanged post-NMS predictions at one fixed threshold."""
+    counts = Counter()
+    for image in image_records:
+        result = match_image(image['gt'], image.get('raw_predictions',
+                                                      image['predictions']),
+                             score_thr=threshold)
+        counts.update(result['counts'])
+    tp = counts['tp']
+    background = counts['background_fp']
+    localization = counts['localization_fp']
+    duplicate = counts['duplicate']
+    fp = background + localization + duplicate
+    fn = counts['fn']
+    return dict(score_threshold=threshold, tp=tp,
+                background_fp=background, localization_fp=localization,
+                duplicate_fp=duplicate, fp=fp, fn=fn,
+                precision=(tp / (tp + fp) if tp + fp else 0.0),
+                recall=(tp / (tp + fn) if tp + fn else 0.0))
+
+
 def _metainfo(sample: Any) -> dict:
     return dict(getattr(sample, 'metainfo', {}) or {})
 
 
-def _write_csv(path: str, rows: Sequence[dict]) -> None:
-    if not rows:
+def _write_csv(path: str, rows: Sequence[dict],
+               fieldnames: Optional[Sequence[str]] = None) -> None:
+    keys = list(fieldnames or dict.fromkeys(k for row in rows for k in row.keys()))
+    if not keys:
         with open(path, 'w', newline='', encoding='utf-8'):
             return
-    keys = list(dict.fromkeys(k for row in rows for k in row.keys()))
     with open(path, 'w', newline='', encoding='utf-8') as handle:
         writer = csv.DictWriter(handle, fieldnames=keys)
         writer.writeheader()
@@ -486,6 +582,7 @@ def main() -> None:
                   f'expected {args.expected_gt}; paired comparison stopped.')
 
     image_records, gt_rows, pred_rows, proposal_rows = [], [], [], []
+    rpn_roi_rows, coordinate_audit_rows = [], []
     visualization_pool = defaultdict(list)
     expected = args.expected_gt
     for batch in loader:
@@ -497,11 +594,13 @@ def main() -> None:
             meta = _metainfo(sample)
             image_id = str(meta.get('img_id', osp.basename(meta.get('img_path', index))))
             gt = _gt_arrays(sample, edges, gt_was_resized)
-            preds = _prediction_records(sample, args.score_thr)
+            raw_preds = _prediction_records(sample)
+            preds = [p for p in raw_preds if p['score'] >= args.score_thr]
             result = match_image(gt, preds, args.score_thr)
             image = dict(image_id=image_id, view=meta.get('view', 'Unknown'),
                          band_type=meta.get('band_type', 'Unknown'), gt=gt,
-                         predictions=preds, score_thr=args.score_thr,
+                         predictions=preds, raw_predictions=raw_preds,
+                         score_thr=args.score_thr,
                          result=result, image_path=meta.get('img_path'))
             image_records.append(image)
             for row in result['gts']:
@@ -521,18 +620,40 @@ def main() -> None:
                 visualization_pool['localization'].append(image)
             if proposals is not None:
                 proposal = proposals[index]
-                boxes = _as_numpy(_get_field(proposal, 'bboxes'), (-1, 4))
+                raw_proposal_boxes = _as_numpy(_get_field(proposal, 'bboxes'), (-1, 4))
                 scores = _as_numpy(_get_field(proposal, 'scores'), (-1,))
-                proposal_scale = np.asarray(
-                    _metainfo(sample).get('scale_factor', 1),
-                    dtype=np.float32).reshape(-1)
-                if proposal_scale.size == 1:
-                    proposal_scale = np.repeat(proposal_scale, 4)
-                if proposal_scale.size == 4:
-                    boxes = boxes / proposal_scale[None, :]
+                boxes = proposal_boxes_original(proposal, sample)
+                proposal_records = [dict(bbox=box, score=float(score))
+                                    for box, score in zip(boxes, scores)]
+                image['rpn_proposals'] = proposal_records
                 proposal_rows.extend(proposal_recall_rows(
-                    [dict(bbox=box, score=float(score))
-                     for box, score in zip(boxes, scores)], gt, image_id))
+                    proposal_records, gt, image_id))
+                rpn_roi_rows.extend(rpn_to_roi_rows(
+                    gt, proposal_records, result, image_id,
+                    image['view'], image['band_type']))
+                coordinate_audit_rows.append(dict(
+                    image_id=image_id,
+                    scale_factor=' '.join(f'{float(x):.6g}'
+                                          for x in scale_factor_array(sample)),
+                    rpn_input_box_count=len(raw_proposal_boxes),
+                    rpn_input_min=(np.min(raw_proposal_boxes, axis=0).tolist()
+                                   if len(raw_proposal_boxes) else []),
+                    rpn_input_max=(np.max(raw_proposal_boxes, axis=0).tolist()
+                                   if len(raw_proposal_boxes) else []),
+                    rpn_original_min=(np.min(boxes, axis=0).tolist()
+                                      if len(boxes) else []),
+                    rpn_original_max=(np.max(boxes, axis=0).tolist()
+                                      if len(boxes) else []),
+                    gt_min=(np.min([g['bbox'] for g in gt], axis=0).tolist()
+                            if gt else []),
+                    gt_max=(np.max([g['bbox'] for g in gt], axis=0).tolist()
+                            if gt else []),
+                    final_min=(np.min([p['bbox'] for p in raw_preds], axis=0).tolist()
+                               if raw_preds else []),
+                    final_max=(np.max([p['bbox'] for p in raw_preds], axis=0).tolist()
+                               if raw_preds else [])))
+            else:
+                image['rpn_proposals'] = []
 
             if compare_samples is not None:
                 compare_gt = _gt_arrays(compare_samples[index], edges,
@@ -572,6 +693,9 @@ def main() -> None:
                     iou_localization=IOU_LOCALIZATION, legacy_coordinate=True,
                     gt_was_resized_before_model=gt_was_resized,
                     rpn_max_per_img=rpn_max_per_img,
+                    rpn_proposal_images=sum(bool(x.get('rpn_proposals'))
+                                            for x in image_records),
+                    rpn_roi_rows=len(rpn_roi_rows),
                     tp=tp, fp=fp, fn=fn,
                     precision=(tp / (tp + fp) if tp + fp else 0.0),
                     recall=(tp / (tp + fn) if tp + fn else 0.0),
@@ -643,6 +767,42 @@ def main() -> None:
         _write_csv(osp.join(args.out_dir, 'proposal_recall.csv'), proposal_output)
     else:
         open(osp.join(args.out_dir, 'proposal_recall.csv'), 'w').close()
+
+    # RPN-to-RoI attribution uses the same one-to-one final TP assignment as
+    # the main error report.  It is intentionally emitted separately so the
+    # historical per-GT/per-image CSVs remain backward compatible.
+    _write_csv(osp.join(args.out_dir, 'rpn_to_roi_analysis.csv'), rpn_roi_rows,
+               fieldnames=('image_id', 'gt_index', 'gt_bbox', 'gt_area',
+                           'best_rpn_iou', 'best_final_iou', 'rpn_hit_03',
+                           'rpn_hit_05', 'final_hit_05', 'category',
+                           'size_group', 'view', 'band_type'))
+    category_counts = Counter(row['category'] for row in rpn_roi_rows)
+    rpn_summary_rows = [dict(category=category, gt_count=count,
+                             fraction=(count / len(rpn_roi_rows)
+                                       if rpn_roi_rows else 0.0))
+                        for category, count in sorted(category_counts.items())]
+    rpn_summary_rows.append(dict(category='all_normal_gt',
+                                 gt_count=len(rpn_roi_rows), fraction=1.0
+                                 if rpn_roi_rows else 0.0))
+    _write_csv(osp.join(args.out_dir, 'rpn_to_roi_summary.csv'),
+               rpn_summary_rows,
+               fieldnames=('category', 'gt_count', 'fraction'))
+    _write_csv(osp.join(args.out_dir, 'score_threshold_analysis.csv'),
+               [threshold_summary(image_records, threshold)
+                for threshold in (0.1, 0.3, 0.5, 0.75)],
+               fieldnames=('score_threshold', 'tp', 'background_fp',
+                           'localization_fp', 'duplicate_fp', 'fp', 'fn',
+                           'precision', 'recall'))
+
+    # Keep coordinate evidence concise but inspectable.  The complete
+    # per-image ranges are retained in this audit table; JSON-like lists are
+    # serialized by _write_csv without changing their numeric values.
+    _write_csv(osp.join(args.out_dir, 'coordinate_audit.csv'),
+               coordinate_audit_rows,
+               fieldnames=('image_id', 'scale_factor', 'rpn_input_box_count',
+                           'rpn_input_min', 'rpn_input_max',
+                           'rpn_original_min', 'rpn_original_max', 'gt_min',
+                           'gt_max', 'final_min', 'final_max'))
     with open(osp.join(args.out_dir, 'summary.json'), 'w', encoding='utf-8') as handle:
         json.dump(summary, handle, indent=2, ensure_ascii=False, allow_nan=False)
 
@@ -696,6 +856,66 @@ def main() -> None:
         lines += ['', warning]
     with open(osp.join(args.out_dir, 'report.md'), 'w', encoding='utf-8') as handle:
         handle.write('\n'.join(lines) + '\n')
+
+    audit_lines = [
+        '# RPN to RoI coordinate audit', '',
+        f'- Git Commit: `{summary["git_commit"]}`',
+        f'- Config: `{summary["config"]}`',
+        f'- Checkpoint: `{summary["checkpoint"]}`',
+        f'- Split: `{args.split}`; images analyzed: {len(image_records)}',
+        f'- Normal GT: {total_gt}; expected: {expected}; '
+        f'count_match={comparison_allowed}', '',
+        '## Coordinate contracts', '',
+        '- Cascade RPN is called with `rescale=False`; its proposals are in '
+        'the resized/model-input coordinate system.',
+        '- The analysis copies those proposal boxes and divides xyxy by the '
+        'four-value `scale_factor` (original to resized). It never mutates '
+        'the proposal object used by the RoI head.',
+        '- Cascade RoI prediction is called with `rescale=True`; final '
+        'detection boxes are already returned in original-image coordinates '
+        'and are not divided again.',
+        '- GT boxes follow the configured transform order. '
+        f'`gt_was_resized_before_model={gt_was_resized}`. For the current '
+        'AuxDet validation pipeline, Resize precedes LoadAnnotations, so XML '
+        'GT coordinates remain in the original coordinate system.',
+        '- `coordinate_audit.csv` records the scale factor and coordinate '
+        'ranges for raw RPN, restored RPN, GT, and final boxes per image.', '',
+        '## Why final recall can exceed RPN proposal recall', '',
+        'RPN recall asks whether a proposal already overlaps a GT at the '
+        'specified IoU before RoI refinement. Final detection recall asks '
+        'whether a one-to-one matched, class-consistent final box reaches '
+        'IoU 0.5 after the Cascade RoI bbox heads decode and regress it. '
+        'A proposal below 0.5 can therefore become a correct final box. '
+        'The RPN and final metrics are different stages and must not be '
+        'compared as if they were the same prediction set.', '',
+        '## Attribution files', '',
+        '- `rpn_to_roi_analysis.csv` contains one row per non-ignored GT. '
+        '`best_final_iou` is diagnostic, while `final_hit_05` is taken from '
+        'the existing one-to-one `match_image` assignment.',
+        '- `rpn_to_roi_summary.csv` counts categories A-E: RPN>=0.5 and '
+        'final TP; RPN in [0.3,0.5) and final TP; RPN<0.3 and final TP; '
+        'RPN>=0.5 and final miss; and RPN<0.3 and final miss. The additional '
+        'F bin retains [0.3,0.5) final misses outside the requested A-E '
+        'partition.',
+        '- Observed RPN-to-RoI category counts: '
+        + ', '.join(f'{key}={category_counts[key]}'
+                    for key in sorted(category_counts))
+        + ('.' if category_counts else 'none (no proposals or normal GT).'),
+        '- `score_threshold_analysis.csv` reuses the unchanged post-NMS '
+        'prediction list at thresholds 0.1, 0.3, 0.5, and 0.75. It does '
+        'not rerun NMS or modify model/evaluator settings.', '',
+        '## Limits', '',
+        '- This report does not establish that the 68% versus 87% gap is a '
+        'coordinate bug; the server output and coordinate ranges must be '
+        'inspected first.',
+        '- Proposal recall is limited by the configured RPN `max_per_img`; '
+        f'the loaded value is `{rpn_max_per_img}`.',
+        '- No numerical A-E or threshold result is claimed until this script '
+        'is run on the server with the real dataset and checkpoint.',
+    ]
+    with open(osp.join(args.out_dir, 'rpn_roi_audit.md'), 'w',
+              encoding='utf-8') as handle:
+        handle.write('\n'.join(audit_lines) + '\n')
 
 
 if __name__ == '__main__':
