@@ -3,7 +3,7 @@ import numpy as np
 
 from tools.analysis_tools.analyze_auxdet_errors import (
     iou_matrix, match_image, proposal_boxes_original, rpn_to_roi_rows,
-    threshold_summary)
+    select_c_cases, threshold_summary)
 
 
 def gt(box, label=0, ignore=False):
@@ -91,6 +91,8 @@ def test_rpn_scale_direction_and_final_regression_attribution():
                            'img-1')
     assert rows[0]['rpn_hit_05'] and rows[0]['final_hit_05']
     assert rows[0]['category'] == 'A_rpn05_final_tp'
+    assert rows[0]['final_matched_index'] == 0
+    assert rows[0]['rpn_best_bbox'] == '10.0000 10.0000 20.0000 20.0000'
 
 
 def test_rpn_low_iou_can_become_final_tp_and_high_iou_can_miss():
@@ -105,6 +107,21 @@ def test_rpn_low_iou_can_become_final_tp_and_high_iou_can_miss():
     assert rows[1]['category'] == 'D_rpn05_final_miss'
 
 
+def test_rpn_roi_uses_actual_tp_prediction_when_best_iou_is_duplicate():
+    truth = [gt((0, 0, 9, 9))]
+    # Higher-score box is the one-to-one TP; the lower-score box has the
+    # larger IoU and is therefore a duplicate, not the TP source.
+    predictions = [pred((0, 0, 7, 9), score=.9, index=0),
+                   pred((0, 0, 9, 9), score=.8, index=1)]
+    result = match_image(truth, predictions)
+    rows = rpn_to_roi_rows(
+        truth, [dict(bbox=np.asarray((50, 50, 59, 59), dtype=np.float32),
+                     score=.7)], result, 'img-3')
+    assert rows[0]['final_hit_05'] == 1
+    assert rows[0]['final_matched_index'] == 0
+    assert rows[0]['final_best_index'] == 1
+
+
 def test_score_threshold_summary_reuses_predictions_without_new_nms():
     truth = [gt((0, 0, 9, 9))]
     image = dict(gt=truth,
@@ -116,3 +133,16 @@ def test_score_threshold_summary_reuses_predictions_without_new_nms():
     assert low['tp'] == high['tp'] == 1
     assert low['background_fp'] == 1 and high['background_fp'] == 0
     assert low['recall'] == high['recall'] == 1.0
+
+
+def test_c_case_selection_prefers_distinct_images_then_fills_limit():
+    rows = [dict(category='C_rpn_lt03_final_tp', image_id='a',
+                 final_matched_score=.9, best_final_iou=.8, gt_index=0),
+            dict(category='C_rpn_lt03_final_tp', image_id='a',
+                 final_matched_score=.95, best_final_iou=.9, gt_index=1),
+            dict(category='C_rpn_lt03_final_tp', image_id='b',
+                 final_matched_score=.7, best_final_iou=.7, gt_index=0),
+            dict(category='A_rpn05_final_tp', image_id='c',
+                 final_matched_score=1.0, best_final_iou=1.0, gt_index=0)]
+    selected = select_c_cases(rows, limit=2)
+    assert [row['image_id'] for row in selected] == ['a', 'b']

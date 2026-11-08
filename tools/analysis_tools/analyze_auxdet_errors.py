@@ -167,6 +167,7 @@ def match_image(gt: Sequence[dict], predictions: Sequence[dict],
     ignore_ious = iou_matrix([p['bbox'] for p in preds],
                              [g['bbox'] for g in ignored])
     matched = set()
+    matched_pred_by_gt = {}
     pred_rows = []
     for pi, pred in enumerate(preds):
         same = np.asarray([g['label'] == pred['label'] for g in normal],
@@ -188,6 +189,7 @@ def match_image(gt: Sequence[dict], predictions: Sequence[dict],
             (ignore_ious[pi] >= iou_tp))[0]
         if best_available_iou >= iou_tp:
             matched.add(best_available)
+            matched_pred_by_gt[best_available] = pred['index']
             category = 'tp'
             matched_gt = best_available
         elif ignore_match.size:
@@ -226,6 +228,7 @@ def match_image(gt: Sequence[dict], predictions: Sequence[dict],
                             ignore=False,
                             size_group=record['size_group'], status=status,
                             best_iou=best_iou,
+                            matched_pred=matched_pred_by_gt.get(gi, -1),
                             best_pred=(preds[best_pi]['index']
                                        if best_pi >= 0 else -1)))
     ignored_rows = []
@@ -241,6 +244,7 @@ def match_image(gt: Sequence[dict], predictions: Sequence[dict],
                                  width=record['width'], height=record['height'],
                                  ignore=True, size_group=record['size_group'],
                                  status='ignored_gt', best_iou=best_iou,
+                                 matched_pred=-1,
                                  best_pred=(preds[best_pi]['index']
                                             if best_pi >= 0 else -1)))
     counts = Counter(row['category'] for row in pred_rows)
@@ -351,7 +355,8 @@ def proposal_boxes_original(proposal: Any, sample_or_meta: Any) -> np.ndarray:
 
 def rpn_to_roi_rows(gt: Sequence[dict], proposals: Sequence[dict],
                     final_result: dict, image_id: str,
-                    view: str = 'Unknown', band_type: str = 'Unknown') -> List[dict]:
+                    view: str = 'Unknown', band_type: str = 'Unknown',
+                    image_path: str = '') -> List[dict]:
     """Join original-coordinate RPN IoU with the actual one-to-one TP result.
 
     ``best_final_iou`` is diagnostic (the best final box for the GT), while
@@ -363,13 +368,39 @@ def rpn_to_roi_rows(gt: Sequence[dict], proposals: Sequence[dict],
     proposal_boxes = np.asarray([p['bbox'] for p in proposals], dtype=np.float32).reshape(-1, 4)
     proposal_ious = iou_matrix([g['bbox'] for g in normal], proposal_boxes)
     final_gt_rows = list(final_result.get('gts', []))
+    final_preds = list(final_result.get('predictions', []))
     rows = []
     for gi, record in enumerate(normal):
-        best_rpn = (float(proposal_ious[gi].max())
-                    if proposal_ious.shape[1] else 0.0)
+        rpn_pi = (int(np.argmax(proposal_ious[gi]))
+                  if proposal_ious.shape[1] else -1)
+        best_rpn = (float(proposal_ious[gi, rpn_pi])
+                    if rpn_pi >= 0 else 0.0)
         final_row = final_gt_rows[gi] if gi < len(final_gt_rows) else {}
         best_final = float(final_row.get('best_iou', 0.0))
         final_hit = final_row.get('status') == 'matched'
+        same_final = [pi for pi, pred in enumerate(final_preds)
+                      if pred['label'] == record['label']]
+        final_pi = (max(same_final,
+                        key=lambda pi: iou_matrix(
+                            [final_preds[pi]['bbox']], [record['bbox']])[0, 0])
+                    if same_final else -1)
+        matched_pred_index = int(final_row.get('matched_pred', -1))
+        matched_pi = next((pi for pi, pred in enumerate(final_preds)
+                           if pred.get('pred_index', pred.get('index', -1))
+                           == matched_pred_index), -1)
+
+        def fmt_box(box: Any) -> str:
+            if box is None:
+                return ''
+            return ' '.join(f'{float(x):.4f}' for x in box)
+
+        def pred_index(item: Optional[dict]) -> int:
+            return (int(item.get('pred_index', item.get('index', -1)))
+                    if item is not None else -1)
+
+        rpn_pred = proposals[rpn_pi] if rpn_pi >= 0 else None
+        final_pred = final_preds[final_pi] if final_pi >= 0 else None
+        matched_pred = final_preds[matched_pi] if matched_pi >= 0 else None
         if best_rpn >= 0.5 and final_hit:
             category = 'A_rpn05_final_tp'
         elif 0.3 <= best_rpn < 0.5 and final_hit:
@@ -384,10 +415,26 @@ def rpn_to_roi_rows(gt: Sequence[dict], proposals: Sequence[dict],
             # [0.3, 0.5) misses are outside the requested A-E bins; retain
             # them explicitly instead of silently folding them into E.
             category = 'F_rpn03_05_final_miss'
-        rows.append(dict(image_id=image_id, gt_index=record.get('index', gi),
+        rows.append(dict(image_id=image_id, image_path=image_path,
+                         gt_index=record.get('index', gi),
                          gt_bbox=' '.join(f'{float(x):.4f}' for x in record['bbox']),
                          gt_area=float(record['area']), best_rpn_iou=best_rpn,
                          best_final_iou=best_final,
+                         rpn_best_index=rpn_pi,
+                         rpn_best_score=(float(rpn_pred.get('score', 0.0))
+                                         if rpn_pred else 0.0),
+                         rpn_best_bbox=fmt_box(rpn_pred['bbox']
+                                               if rpn_pred else None),
+                         final_best_index=pred_index(final_pred),
+                         final_best_score=(float(final_pred['score'])
+                                           if final_pred else 0.0),
+                         final_best_bbox=fmt_box(final_pred['bbox']
+                                                 if final_pred else None),
+                         final_matched_index=matched_pred_index,
+                         final_matched_score=(float(matched_pred['score'])
+                                              if matched_pred else 0.0),
+                         final_matched_bbox=fmt_box(
+                             matched_pred['bbox'] if matched_pred else None),
                          rpn_hit_03=int(best_rpn >= 0.3),
                          rpn_hit_05=int(best_rpn >= 0.5),
                          final_hit_05=int(final_hit), category=category,
@@ -415,6 +462,29 @@ def threshold_summary(image_records: Sequence[dict], threshold: float) -> dict:
                 duplicate_fp=duplicate, fp=fp, fn=fn,
                 precision=(tp / (tp + fp) if tp + fp else 0.0),
                 recall=(tp / (tp + fn) if tp + fn else 0.0))
+
+
+def select_c_cases(rows: Sequence[dict], limit: int = 20) -> List[dict]:
+    """Select deterministic C-class cases with image-level diversity first."""
+    candidates = [row for row in rows
+                  if row.get('category') == 'C_rpn_lt03_final_tp']
+    candidates.sort(key=lambda row: (-float(row.get('final_matched_score', 0.0)),
+                                    -float(row.get('best_final_iou', 0.0)),
+                                    row.get('image_id', ''),
+                                    int(row.get('gt_index', 0))))
+    selected, used_images = [], set()
+    for row in candidates:
+        if len(selected) >= limit:
+            break
+        if row.get('image_id') in used_images:
+            continue
+        selected.append(row)
+        used_images.add(row.get('image_id'))
+    if len(selected) < limit:
+        selected_ids = {id(row) for row in selected}
+        selected.extend(row for row in candidates
+                        if id(row) not in selected_ids)
+    return selected[:limit]
 
 
 def _metainfo(sample: Any) -> dict:
@@ -583,6 +653,7 @@ def main() -> None:
 
     image_records, gt_rows, pred_rows, proposal_rows = [], [], [], []
     rpn_roi_rows, coordinate_audit_rows = [], []
+    scale_factors_seen = []
     visualization_pool = defaultdict(list)
     expected = args.expected_gt
     for batch in loader:
@@ -592,6 +663,8 @@ def main() -> None:
             compare_samples, _ = _run_model(compare_model, batch, args.device)
         for index, sample in enumerate(samples):
             meta = _metainfo(sample)
+            sample_scale = scale_factor_array(sample)
+            scale_factors_seen.append(tuple(float(x) for x in sample_scale))
             image_id = str(meta.get('img_id', osp.basename(meta.get('img_path', index))))
             gt = _gt_arrays(sample, edges, gt_was_resized)
             raw_preds = _prediction_records(sample)
@@ -630,11 +703,11 @@ def main() -> None:
                     proposal_records, gt, image_id))
                 rpn_roi_rows.extend(rpn_to_roi_rows(
                     gt, proposal_records, result, image_id,
-                    image['view'], image['band_type']))
+                    image['view'], image['band_type'], image['image_path']))
                 coordinate_audit_rows.append(dict(
                     image_id=image_id,
                     scale_factor=' '.join(f'{float(x):.6g}'
-                                          for x in scale_factor_array(sample)),
+                                          for x in sample_scale),
                     rpn_input_box_count=len(raw_proposal_boxes),
                     rpn_input_min=(np.min(raw_proposal_boxes, axis=0).tolist()
                                    if len(raw_proposal_boxes) else []),
@@ -696,6 +769,18 @@ def main() -> None:
                     rpn_proposal_images=sum(bool(x.get('rpn_proposals'))
                                             for x in image_records),
                     rpn_roi_rows=len(rpn_roi_rows),
+                    c_case_count=min(20, sum(row['category'] ==
+                                             'C_rpn_lt03_final_tp'
+                                             for row in rpn_roi_rows)),
+                    scale_factor_identity_images=sum(
+                        all(abs(x - 1.0) < 1e-6 for x in factor)
+                        for factor in scale_factors_seen),
+                    scale_factor_nonidentity_images=sum(
+                        any(abs(x - 1.0) >= 1e-6 for x in factor)
+                        for factor in scale_factors_seen),
+                    scale_factor_unique=[' '.join(f'{x:.6g}' for x in factor)
+                                         for factor in sorted(
+                                             set(scale_factors_seen))],
                     tp=tp, fp=fp, fn=fn,
                     precision=(tp / (tp + fp) if tp + fp else 0.0),
                     recall=(tp / (tp + fn) if tp + fn else 0.0),
@@ -772,10 +857,25 @@ def main() -> None:
     # the main error report.  It is intentionally emitted separately so the
     # historical per-GT/per-image CSVs remain backward compatible.
     _write_csv(osp.join(args.out_dir, 'rpn_to_roi_analysis.csv'), rpn_roi_rows,
-               fieldnames=('image_id', 'gt_index', 'gt_bbox', 'gt_area',
+               fieldnames=('image_id', 'image_path', 'gt_index', 'gt_bbox', 'gt_area',
                            'best_rpn_iou', 'best_final_iou', 'rpn_hit_03',
+                           'rpn_best_index', 'rpn_best_score', 'rpn_best_bbox',
+                           'final_best_index', 'final_best_score',
+                           'final_best_bbox', 'final_matched_index',
+                           'final_matched_score', 'final_matched_bbox',
                            'rpn_hit_05', 'final_hit_05', 'category',
                            'size_group', 'view', 'band_type'))
+    c_cases = select_c_cases(rpn_roi_rows, limit=20)
+    _write_csv(osp.join(args.out_dir, 'c_rpn_roi_cases.csv'), c_cases,
+               fieldnames=('image_id', 'image_path', 'gt_index', 'gt_bbox',
+                           'gt_area', 'best_rpn_iou', 'rpn_best_index',
+                           'rpn_best_score', 'rpn_best_bbox',
+                           'best_final_iou', 'final_best_index',
+                           'final_best_score', 'final_best_bbox',
+                           'final_matched_index', 'final_matched_score',
+                           'final_matched_bbox', 'rpn_hit_03', 'rpn_hit_05',
+                           'final_hit_05', 'category', 'size_group', 'view',
+                           'band_type'))
     category_counts = Counter(row['category'] for row in rpn_roi_rows)
     rpn_summary_rows = [dict(category=category, gt_count=count,
                              fraction=(count / len(rpn_roi_rows)
@@ -837,6 +937,7 @@ def main() -> None:
              '', '## Summary', '',
              f'- TP={tp}, FP={fp}, FN={fn}',
              f'- Precision={summary["precision"]:.6f}, Recall={summary["recall"]:.6f}',
+             f'- C-class cases exported: {summary["c_case_count"]}',
              f'- Custom AP50 (area PR): {summary["ap50_custom"]:.6f}'
              if summary['ap50_custom'] is not None
              else '- Custom AP50 (area PR): unavailable (no normal GT)',
@@ -865,6 +966,10 @@ def main() -> None:
         f'- Split: `{args.split}`; images analyzed: {len(image_records)}',
         f'- Normal GT: {total_gt}; expected: {expected}; '
         f'count_match={comparison_allowed}', '',
+        f'- scale_factor identity images: '
+        f'{summary["scale_factor_identity_images"]}/{len(scale_factors_seen)}; '
+        f'non-identity images: {summary["scale_factor_nonidentity_images"]}',
+        f'- unique scale_factor values: {summary["scale_factor_unique"]}', '',
         '## Coordinate contracts', '',
         '- Cascade RPN is called with `rescale=False`; its proposals are in '
         'the resized/model-input coordinate system.',
@@ -904,6 +1009,10 @@ def main() -> None:
         '- `score_threshold_analysis.csv` reuses the unchanged post-NMS '
         'prediction list at thresholds 0.1, 0.3, 0.5, and 0.75. It does '
         'not rerun NMS or modify model/evaluator settings.', '',
+        '- `c_rpn_roi_cases.csv` contains up to 20 deterministic C-class '
+        'cases, preferring one case per image. It includes the nearest RPN '
+        'Proposal, the highest-IoU final prediction, and the actual matched '
+        'TP prediction when those differ.', '',
         '## Limits', '',
         '- This report does not establish that the 68% versus 87% gap is a '
         'coordinate bug; the server output and coordinate ranges must be '
